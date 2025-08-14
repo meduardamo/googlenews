@@ -2,6 +2,7 @@
 import os
 import json
 import time
+import base64
 import shutil
 import pandas as pd
 from selenium import webdriver
@@ -15,6 +16,51 @@ from tqdm import tqdm
 import gspread
 from gspread_dataframe import set_with_dataframe
 from oauth2client.service_account import ServiceAccountCredentials
+
+CREDENTIALS_PATH = "credentials.json"  # <- vai se chamar assim
+
+# ======================================
+# Helpers para garantir o credentials.json
+# ======================================
+def _try_json_loads(s):
+    """Tenta json.loads e, se virar string, tenta de novo (JSON duplamente encodado)."""
+    obj = json.loads(s)
+    if isinstance(obj, str):
+        obj = json.loads(obj)
+    if not isinstance(obj, dict):
+        raise ValueError("Conteúdo não é um objeto JSON válido (dict).")
+    return obj
+
+def _load_service_account_from_env():
+    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        return None
+    # 1) tenta JSON direto / duplamente encodado
+    try:
+        return _try_json_loads(raw)
+    except Exception:
+        pass
+    # 2) tenta base64 -> JSON
+    try:
+        decoded = base64.b64decode(raw).decode("utf-8")
+        return _try_json_loads(decoded)
+    except Exception:
+        pass
+    raise ValueError("GCP_SERVICE_ACCOUNT_JSON não está em um formato válido (JSON bruto, JSON encodado em string ou base64 de JSON).")
+
+def ensure_credentials_file(path=CREDENTIALS_PATH):
+    """Garante que credentials.json exista. Se não existir, cria a partir do secret do ambiente."""
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        return path
+    sa = _load_service_account_from_env()
+    if not sa:
+        raise RuntimeError(
+            f"Arquivo {path} não encontrado e variável de ambiente GCP_SERVICE_ACCOUNT_JSON ausente."
+        )
+    # escreve JSON “bonitinho” para evitar problemas de escape
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(sa, f, ensure_ascii=False)
+    return path
 
 # =======================
 # CONFIGURAÇÕES SELENIUM
@@ -140,21 +186,18 @@ with pd.ExcelWriter('noticias_PNE_Planos_Educacao.xlsx') as writer:
 print("\n✅ Notícias salvas no Excel 'noticias_PNE_Planos_Educacao.xlsx'.")
 
 # =======================
-# GOOGLE SHEETS (via SECRET)
+# GOOGLE SHEETS (usando credentials.json)
 # =======================
-# Requer secret GCP_SERVICE_ACCOUNT_JSON com o JSON completo da conta de serviço
-service_account_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-if not service_account_json:
-    raise RuntimeError("Secret GCP_SERVICE_ACCOUNT_JSON não encontrado nas variáveis de ambiente.")
+# Garante que o arquivo exista (cria a partir do secret se necessário)
+cred_path = ensure_credentials_file(CREDENTIALS_PATH)
 
-service_account_info = json.loads(service_account_json)
 scope = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
-credentials = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scopes=scope)
+credentials = ServiceAccountCredentials.from_json_keyfile_name(cred_path, scopes=scope)
 gc = gspread.authorize(credentials)
 
 # Abrir a planilha por KEY (ajuste se necessário)
 SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
-worksheet_name = 'PNE'
+worksheet_name = 'google notícias'
 
 spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
 try:
@@ -167,4 +210,4 @@ set_with_dataframe(
     df_geral_final if not df_geral_final.empty else pd.DataFrame(columns=['Título','Fonte','Data de Publicação','Link','Termo de Busca'])
 )
 
-print("\n✅ Dados enviados para o Google Sheets na aba 'PNE'.")
+print("\n✅ Dados enviados para o Google Sheets na aba 'google notícias'.")
