@@ -1,30 +1,33 @@
-name: News scraper (PNE / Google News)
+name: Raspagem Google News (Sheets + Email)
 
 on:
-  workflow_dispatch: {}
   schedule:
-    # roda todo dia às 11:00 UTC (08:00 America/Recife)
-    - cron: "0 11 * * *"
+    - cron: '0 11 * * *'   # 11:00 UTC (~08:00 America/Recife)
+  workflow_dispatch:
 
 jobs:
-  run:
+  run-script:
     runs-on: ubuntu-latest
     env:
       TZ: America/Recife
-      # Passe o secret com o JSON (bruto, string JSON ou base64).
-      # O scraper.py já lida com qualquer um desses formatos e também
-      # consegue criar o arquivo caso ele não exista.
-      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-      WDM_LOG_LEVEL: "0" # menos ruído do webdriver_manager
+      # variáveis usadas pelo scraper.py
+      PLANILHA: ${{ secrets.PLANILHA }}                 # key da planilha (ex: 1G81BndS...gnwcY)
+      ABA: "google notícias"                            # nome da worksheet; aspas pq tem espaço
+      EMAIL: ${{ secrets.EMAIL }}                       # remetente cadastrado no Brevo
+      DESTINATARIOS: ${{ secrets.DESTINATARIOS }}       # lista separada por vírgula
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}       # API key do Brevo
+      # Se seu scraper também lê este secret para criar o arquivo, mantemos disponível:
+      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+      WDM_LOG_LEVEL: "0"                                # menos ruído do webdriver_manager
 
     steps:
-      - name: Checkout
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Cache pip
         uses: actions/cache@v4
@@ -44,22 +47,23 @@ jobs:
           google-chrome --version || true
           which google-chrome || true
 
-      - name: Install Python deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Opcional: gravar o credentials.json a partir do secret (sem validação inline)
-      # Se preferir, pode remover este passo — o scraper.py já cria o arquivo se não existir.
-      - name: Write credentials.json from secret (optional)
+      - name: Create credentials.json from secret
         shell: bash
         run: |
-          if [ -n "${GCP_SERVICE_ACCOUNT_JSON}" ]; then
-            # grava exatamente o conteúdo do secret (mantém \n corretamente)
+          if [ -n "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" ]; then
+            printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > credentials.json
+            echo "credentials.json criado com $(wc -c < credentials.json) bytes"
+          elif [ -n "${GCP_SERVICE_ACCOUNT_JSON}" ]; then
             printf '%s' "${GCP_SERVICE_ACCOUNT_JSON}" > credentials.json
-            echo "credentials.json escrito com $(wc -c < credentials.json) bytes"
+            echo "credentials.json criado (via GCP_SERVICE_ACCOUNT_JSON) com $(wc -c < credentials.json) bytes"
           else
-            echo "GCP_SERVICE_ACCOUNT_JSON não definido; o scraper.py vai tentar criar o arquivo."
+            echo "ERRO: nenhum secret de credenciais encontrado (GOOGLE_APPLICATION_CREDENTIALS_JSON ou GCP_SERVICE_ACCOUNT_JSON)."
+            exit 1
           fi
 
       - name: Run scraper
