@@ -3,7 +3,7 @@ name: News scraper (PNE / Google News)
 on:
   workflow_dispatch: {}
   schedule:
-    # roda todo dia às 11:00 UTC (08:00 em America/Recife)
+    # roda todo dia às 11:00 UTC (08:00 America/Recife)
     - cron: "0 11 * * *"
 
 jobs:
@@ -11,6 +11,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: America/Recife
+      # Secret com o JSON (bruto, string JSON ou base64). O script lida com todos.
       GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
       WDM_LOG_LEVEL: "0" # menos ruído do webdriver_manager
 
@@ -45,6 +46,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # Grava o credentials.json a partir do secret e faz uma checagem básica
+      - name: Write credentials.json from secret
+        shell: bash
+        run: |
+          cat > credentials.json << 'EOF'
+          ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+          EOF
+          echo "credentials.json escrito com $(wc -c < credentials.json) bytes"
+          python - << 'PY'
+import json
+with open('credentials.json','r',encoding='utf-8') as f:
+    data = json.load(f)
+print("keys:", sorted(k for k in data.keys() if k in ('type','project_id','client_email','client_id')))
+PY
 
       - name: Run scraper
         run: |
