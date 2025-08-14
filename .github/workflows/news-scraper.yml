@@ -11,7 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: America/Recife
-      # Secret com o JSON (bruto, string JSON ou base64). O script lida com todos.
+      # Passe o secret com o JSON (bruto, string JSON ou base64).
+      # O scraper.py já lida com qualquer um desses formatos e também
+      # consegue criar o arquivo caso ele não exista.
       GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
       WDM_LOG_LEVEL: "0" # menos ruído do webdriver_manager
 
@@ -47,20 +49,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Grava o credentials.json a partir do secret e faz uma checagem básica
-      - name: Write credentials.json from secret
+      # Opcional: gravar o credentials.json a partir do secret (sem validação inline)
+      # Se preferir, pode remover este passo — o scraper.py já cria o arquivo se não existir.
+      - name: Write credentials.json from secret (optional)
         shell: bash
         run: |
-          cat > credentials.json << 'EOF'
-          ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
-          EOF
-          echo "credentials.json escrito com $(wc -c < credentials.json) bytes"
-          python - << 'PY'
-import json
-with open('credentials.json','r',encoding='utf-8') as f:
-    data = json.load(f)
-print("keys:", sorted(k for k in data.keys() if k in ('type','project_id','client_email','client_id')))
-PY
+          if [ -n "${GCP_SERVICE_ACCOUNT_JSON}" ]; then
+            # grava exatamente o conteúdo do secret (mantém \n corretamente)
+            printf '%s' "${GCP_SERVICE_ACCOUNT_JSON}" > credentials.json
+            echo "credentials.json escrito com $(wc -c < credentials.json) bytes"
+          else
+            echo "GCP_SERVICE_ACCOUNT_JSON não definido; o scraper.py vai tentar criar o arquivo."
+          fi
 
       - name: Run scraper
         run: |
