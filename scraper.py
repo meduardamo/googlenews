@@ -1,22 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Raspagem Google News → Google Sheets → E-mail (Brevo)
+Google News → Google Sheets → E-mail (Brevo)
+Requer 'credentials.json' NA RAIZ do repositório (commitado).
 
-Variáveis de ambiente esperadas:
-- PLANILHA            (obrigatória)  -> key da planilha (ex: 1AbC...xYz)
-- ABA                 (opcional)     -> nome da worksheet (default: "PNE")
-- EMAIL               (obrigatória)  -> e-mail do remetente (precisa existir no Brevo)
-- DESTINATARIOS       (obrigatória)  -> lista separada por vírgula (ex: "a@b.com,c@d.com")
-- BREVO_API_KEY       (obrigatória)  -> API Key do Brevo
-Arquivos:
-- credentials.json    (obrigatório)  -> criado no CI a partir do secret GOOGLE_APPLICATION_CREDENTIALS_JSON
+ENV esperadas:
+- PLANILHA        (obrigatória) key da planilha (depois de /d/ e antes de /edit)
+- ABA             (opcional)    nome da worksheet; padrão "PNE"
+- EMAIL           (obrigatória) remetente cadastrado no Brevo
+- DESTINATARIOS   (obrigatória) lista separada por vírgula (a@b.com,c@d.com)
+- BREVO_API_KEY   (obrigatória) API key Brevo
 """
 
 import os
-import json
 import time
 import shutil
-import re
 from datetime import datetime
 from typing import Dict, List
 
@@ -39,18 +36,12 @@ from brevo_python.api.transactional_emails_api import TransactionalEmailsApi
 from brevo_python.models.send_smtp_email import SendSmtpEmail
 
 
-# ================================
-# Configurações / Parâmetros
-# ================================
 SEARCH_TERMS = ['PNE', 'Plano Nacional de Educação', 'saúde mental']
 GOOGLE_NEWS_ROOT = 'https://news.google.com'
 GOOGLE_NEWS_QUERY = "https://news.google.com/search?q={query}&hl=pt-BR&gl=BR&ceid=BR%3Apt-419"
-CREDENTIALS_PATH = "credentials.json"
+CREDENTIALS_PATH = "credentials.json"  # ← commitado no repo
 
 
-# ================================
-# Selenium (Chrome headless)
-# ================================
 def build_driver() -> webdriver.Chrome:
     opts = Options()
     opts.add_argument("--headless=new")
@@ -64,13 +55,9 @@ def build_driver() -> webdriver.Chrome:
     if chrome_path:
         opts.binary_location = chrome_path
 
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
-    return driver
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
 
-# ================================
-# Raspagem Google News
-# ================================
 def raspa_google_news(search_terms: List[str]) -> Dict[str, pd.DataFrame]:
     driver = build_driver()
     resultados: Dict[str, pd.DataFrame] = {}
@@ -83,7 +70,6 @@ def raspa_google_news(search_terms: List[str]) -> Dict[str, pd.DataFrame]:
         driver.get(url)
         time.sleep(3)
 
-        # Scroll até o fim para carregar tudo
         last_height = driver.execute_script("return document.body.scrollHeight")
         while True:
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -105,7 +91,7 @@ def raspa_google_news(search_terms: List[str]) -> Dict[str, pd.DataFrame]:
                 publisher = item.find('div', class_='vr1PYe') or item.find('div', class_='wsLqz')
                 time_tag = item.find('time', class_='hvbAAd') or item.find('time')
 
-                # Trata data
+                # data
                 data_publicacao = "Data não encontrada"
                 if time_tag and time_tag.get("datetime"):
                     try:
@@ -114,6 +100,7 @@ def raspa_google_news(search_terms: List[str]) -> Dict[str, pd.DataFrame]:
                     except ValueError:
                         data_publicacao = "Data inválida"
 
+                # link
                 link = "Link não encontrado"
                 if link_item and link_item.get("href"):
                     href = link_item["href"]
@@ -135,7 +122,6 @@ def raspa_google_news(search_terms: List[str]) -> Dict[str, pd.DataFrame]:
                 print(f"Erro ao processar notícia: {e}")
 
         df = pd.DataFrame(noticias)
-        # Filtro últimas 24h
         hoje = pd.Timestamp.now()
         if not df.empty:
             df["Data Convertida"] = pd.to_datetime(df["Data de Publicação"], format="%d/%m/%Y", errors="coerce")
@@ -150,9 +136,6 @@ def raspa_google_news(search_terms: List[str]) -> Dict[str, pd.DataFrame]:
     return resultados
 
 
-# ================================
-# Salvar Excel + Google Sheets
-# ================================
 def salva_resultados(resultados: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     frames = [df for df in resultados.values() if not df.empty]
     df_geral = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(
@@ -161,7 +144,7 @@ def salva_resultados(resultados: Dict[str, pd.DataFrame]) -> pd.DataFrame:
     if not df_geral.empty and "Link" in df_geral.columns:
         df_geral.drop_duplicates(subset="Link", inplace=True)
 
-    # Excel local (para artifact do CI)
+    # Excel (artifact)
     writer_name = "noticias_PNE_Planos_Educacao.xlsx"
     with pd.ExcelWriter(writer_name) as w:
         df_geral.to_excel(w, sheet_name="Noticias", index=False)
@@ -172,16 +155,16 @@ def salva_resultados(resultados: Dict[str, pd.DataFrame]) -> pd.DataFrame:
         resumo.to_excel(w, sheet_name="Resumo", index=False)
     print(f"\n✅ Excel salvo: {writer_name}")
 
-    # Google Sheets
+    # Google Sheets (via credentials.json COMMITADO)
     spreadsheet_key = os.getenv("PLANILHA")
     if not spreadsheet_key:
-        raise ValueError("❌ Variável de ambiente PLANILHA não definida (key da planilha)")
-
+        raise ValueError("❌ Variável PLANILHA não definida (key da planilha)")
     aba = os.getenv("ABA", "PNE")
 
-    scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     if not os.path.exists(CREDENTIALS_PATH):
-        raise FileNotFoundError("❌ credentials.json não encontrado. No CI, ele é criado a partir do secret.")
+        raise FileNotFoundError("❌ credentials.json não encontrado na raiz do repo.")
+
+    scopes = ['https://spreadsheets.google.com/feeds', 'https://www.googleapis.com/auth/drive']
     creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_PATH, scopes=scopes)
     gc = gspread.authorize(creds)
 
@@ -193,13 +176,9 @@ def salva_resultados(resultados: Dict[str, pd.DataFrame]) -> pd.DataFrame:
 
     set_with_dataframe(ws, df_geral)
     print(f"✅ Dados enviados ao Google Sheets ({spreadsheet_key}) na aba '{aba}'.")
-
     return df_geral
 
 
-# ================================
-# E-mail (Brevo)
-# ================================
 def envia_email_brevo(df_geral: pd.DataFrame, resultados: Dict[str, pd.DataFrame]) -> None:
     api_key = os.getenv("BREVO_API_KEY")
     remetente = os.getenv("EMAIL")
@@ -216,17 +195,11 @@ def envia_email_brevo(df_geral: pd.DataFrame, resultados: Dict[str, pd.DataFrame
     planilha_key = os.getenv("PLANILHA")
     planilha_url = f"https://docs.google.com/spreadsheets/d/{planilha_key}/edit#gid=0" if planilha_key else "#"
 
-    # Bloco de resumo por termo
-    resumo_li = "".join(
-        f"<li><b>{termo}</b>: {len(resultados[termo])} notícias</li>"
-        for termo in resultados
-    )
+    resumo_li = "".join(f"<li><b>{t}</b>: {len(resultados[t])} notícias</li>" for t in resultados)
 
-    # Algumas primeiras notícias (até 10)
     itens = []
     if not df_geral.empty:
-        top = df_geral.head(10).to_dict("records")
-        for r in top:
+        for r in df_geral.head(10).to_dict("records"):
             itens.append(f"<li><a href='{r['Link']}' target='_blank'>{r['Título']}</a> — {r['Fonte']}</li>")
     itens_html = "".join(itens) if itens else "<li>(sem itens nas últimas 24h)</li>"
 
@@ -258,9 +231,6 @@ def envia_email_brevo(df_geral: pd.DataFrame, resultados: Dict[str, pd.DataFrame
         print(f"✅ E-mail enviado para {dest}")
 
 
-# ================================
-# Execução principal
-# ================================
 if __name__ == "__main__":
     resultados = raspa_google_news(SEARCH_TERMS)
     df = salva_resultados(resultados)
