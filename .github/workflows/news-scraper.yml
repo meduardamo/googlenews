@@ -1,61 +1,66 @@
-name: Raspagem Google News (Sheets + Email) — cred no repo
+name: Scraper Google Notícias
 
 on:
+  # Executa automaticamente todos os dias às 8h (horário UTC)
   schedule:
-    - cron: '0 11 * * *'   # 11:00 UTC (~08:00 America/Recife)
+    - cron: '0 8 * * *'  # 8h UTC = 5h BR (horário de Brasília)
+  
+  # Permite execução manual
   workflow_dispatch:
+  
+  # Executa quando há push na branch main (para testes)
+  push:
+    branches: [ main ]
+    paths: 
+      - 'scraper.py'
+      - '.github/workflows/news-scraper.yml'
 
 jobs:
-  run-script:
+  scrape-news:
     runs-on: ubuntu-latest
-    env:
-      TZ: America/Recife
-      PLANILHA: ${{ secrets.PLANILHA }}                 # key da planilha
-      ABA: "google notícias"                            # se tiver espaço, deixe entre aspas
-      EMAIL: ${{ secrets.EMAIL }}                       # remetente (Brevo)
-      DESTINATARIOS: ${{ secrets.DESTINATARIOS }}       # "a@b.com,c@d.com"
-      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}       # chave do Brevo
-      WDM_LOG_LEVEL: "0"
-
+    
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: stable
-
-      - name: Show Chrome version
-        run: |
-          google-chrome --version || true
-          which google-chrome || true
-
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run scraper
-        run: |
-          python NEWS_GOOGLE.py
-
-      - name: Upload Excel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: noticias_PNE_Planos_Educacao
-          path: noticias_PNE_Planos_Educacao.xlsx
-          if-no-files-found: error
+    - name: 📥 Checkout do código
+      uses: actions/checkout@v4
+      
+    - name: 🐍 Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        
+    - name: 📦 Instalar dependências
+      run: |
+        pip install --upgrade pip
+        pip install pandas selenium beautifulsoup4 tqdm gspread gspread-dataframe oauth2client webdriver-manager openpyxl
+        
+    - name: 🌐 Setup Chrome e ChromeDriver
+      uses: browser-actions/setup-chrome@v1
+      with:
+        chrome-version: stable
+        
+    - name: 🔧 Configurar display virtual (para Selenium)
+      run: |
+        export DISPLAY=:99
+        Xvfb :99 -screen 0 1920x1080x24 &
+        
+    - name: 🚀 Executar scraper
+      env:
+        GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+      run: |
+        python scraper.py
+        
+    - name: 📤 Upload dos arquivos gerados
+      uses: actions/upload-artifact@v4
+      if: always()  # Executa mesmo se houver falha
+      with:
+        name: noticias-excel-${{ github.run_number }}
+        path: '*.xlsx'
+        retention-days: 30
+        
+    - name: 📊 Relatório de execução
+      if: always()
+      run: |
+        echo "🎯 Scraping executado em: $(date)"
+        echo "📁 Arquivos gerados:"
+        ls -la *.xlsx 2>/dev/null || echo "Nenhum arquivo Excel encontrado"
