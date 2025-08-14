@@ -1,4 +1,4 @@
-name: Raspagem Google News (Sheets + Email)
+name: Raspagem Google News (Sheets + Email) — cred no repo
 
 on:
   schedule:
@@ -10,18 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: America/Recife
-      # variáveis usadas pelo scraper.py
-      PLANILHA: ${{ secrets.PLANILHA }}                 # key da planilha (ex: 1G81BndS...gnwcY)
-      ABA: "google notícias"                            # nome da worksheet; aspas pq tem espaço
-      EMAIL: ${{ secrets.EMAIL }}                       # remetente cadastrado no Brevo
-      DESTINATARIOS: ${{ secrets.DESTINATARIOS }}       # lista separada por vírgula
-      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}       # API key do Brevo
-      # Se seu scraper também lê este secret para criar o arquivo, mantemos disponível:
-      GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
-      WDM_LOG_LEVEL: "0"                                # menos ruído do webdriver_manager
+      PLANILHA: ${{ secrets.PLANILHA }}                 # key da planilha
+      ABA: "google notícias"                            # se tiver espaço, deixe entre aspas
+      EMAIL: ${{ secrets.EMAIL }}                       # remetente (Brevo)
+      DESTINATARIOS: ${{ secrets.DESTINATARIOS }}       # "a@b.com,c@d.com"
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}       # chave do Brevo
+      WDM_LOG_LEVEL: "0"
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -47,28 +44,14 @@ jobs:
           google-chrome --version || true
           which google-chrome || true
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Create credentials.json from secret
-        shell: bash
-        run: |
-          if [ -n "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" ]; then
-            printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > credentials.json
-            echo "credentials.json criado com $(wc -c < credentials.json) bytes"
-          elif [ -n "${GCP_SERVICE_ACCOUNT_JSON}" ]; then
-            printf '%s' "${GCP_SERVICE_ACCOUNT_JSON}" > credentials.json
-            echo "credentials.json criado (via GCP_SERVICE_ACCOUNT_JSON) com $(wc -c < credentials.json) bytes"
-          else
-            echo "ERRO: nenhum secret de credenciais encontrado (GOOGLE_APPLICATION_CREDENTIALS_JSON ou GCP_SERVICE_ACCOUNT_JSON)."
-            exit 1
-          fi
-
       - name: Run scraper
         run: |
-          python scraper.py
+          python NEWS_GOOGLE.py
 
       - name: Upload Excel artifact
         uses: actions/upload-artifact@v4
