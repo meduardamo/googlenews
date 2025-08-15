@@ -1,66 +1,62 @@
 name: Scraper Google Notícias
 
 on:
-  # Executa automaticamente todos os dias às 8h (horário UTC)
   schedule:
-    - cron: '0 8 * * *'  # 8h UTC = 5h BR (horário de Brasília)
-  
-  # Permite execução manual
+    - cron: '0 8 * * *'  # 08:00 UTC (ajuste aqui se quiser outro horário)
   workflow_dispatch:
-  
-  # Executa quando há push na branch main (para testes)
   push:
     branches: [ main ]
-    paths: 
+    paths:
       - 'scraper.py'
       - '.github/workflows/news-scraper.yml'
 
 jobs:
   scrape-news:
     runs-on: ubuntu-latest
-    
+
     steps:
     - name: 📥 Checkout do código
       uses: actions/checkout@v4
-      
+
     - name: 🐍 Setup Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
         cache: 'pip'
-        
+
     - name: 📦 Instalar dependências
       run: |
         pip install --upgrade pip
-        pip install pandas selenium beautifulsoup4 tqdm gspread gspread-dataframe oauth2client webdriver-manager openpyxl
-        
-    - name: 🌐 Setup Chrome e ChromeDriver
+        pip install pandas selenium beautifulsoup4 tqdm gspread gspread-dataframe google-auth webdriver-manager openpyxl
+
+    - name: 🌐 Setup Chrome
       uses: browser-actions/setup-chrome@v1
       with:
         chrome-version: stable
-        
+
     - name: 🔧 Configurar display virtual (para Selenium)
       run: |
         export DISPLAY=:99
         Xvfb :99 -screen 0 1920x1080x24 &
-        
+
     - name: 🚀 Executar scraper
       env:
+        # Aceita qualquer um dos dois nomes de secret:
         GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
+        GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
       run: |
         python scraper.py
-        
+
     - name: 📤 Upload dos arquivos gerados
       uses: actions/upload-artifact@v4
-      if: always()  # Executa mesmo se houver falha
+      if: always()
       with:
         name: noticias-excel-${{ github.run_number }}
         path: '*.xlsx'
         retention-days: 30
-        
+
     - name: 📊 Relatório de execução
       if: always()
       run: |
-        echo "🎯 Scraping executado em: $(date)"
-        echo "📁 Arquivos gerados:"
+        echo "🎯 Scraping executado em: $(date -u) UTC"
         ls -la *.xlsx 2>/dev/null || echo "Nenhum arquivo Excel encontrado"
