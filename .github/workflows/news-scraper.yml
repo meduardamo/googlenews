@@ -2,7 +2,7 @@ name: Scraper Google Notícias
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # 08:00 UTC (ajuste aqui se quiser outro horário)
+    - cron: '0 * * * *'  # 08:00 UTC (ajuste aqui se quiser outro horário)
   workflow_dispatch:
   push:
     branches: [ main ]
