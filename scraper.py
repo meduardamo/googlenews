@@ -2,24 +2,25 @@
 import os
 import json
 import time
-import shutil
 import hashlib
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
+import re
+import sys
+from datetime import datetime, timezone, timedelta
+
 import pandas as pd
 import requests
+from bs4 import BeautifulSoup
+from tqdm import tqdm
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-from bs4 import BeautifulSoup
-from datetime import datetime, timezone, timedelta
-from tqdm import tqdm
+from selenium.webdriver.support.ui import WebDriverWait
+
 import gspread
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
-import sys
-
-# NEW: utils p/ tratar URLs
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 # =========================
 # Utilidades de horário
@@ -47,16 +48,14 @@ def setup_driver():
     options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    options.add_argument("--disable-images")
-    options.add_argument("--disable-javascript")  # JS off pode impedir alguns redirects; fallback cobre
+    # IMPORTANTE: não desabilitar JS, pois alguns redirecionamentos dependem dele
+    # options.add_argument("--disable-javascript")
 
-    # Em Actions, essas flags evitam throttling quando headless
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
 
-    # Se o setup-chrome já pôs o Chrome no PATH, o Selenium Manager resolve o driver certo sozinho
     try:
         driver = webdriver.Chrome(options=options)
         print("✅ WebDriver configurado com sucesso (Selenium Manager)")
@@ -85,7 +84,7 @@ def _gspread_client_from_env():
 
 SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
 WORKSHEET_DATA = 'google notícias'
-WORKSHEET_FP = '_fingerprints'  # aba "oculta" lógica (não precisa aparecer para o usuário)
+WORKSHEET_FP = '_fingerprints'
 
 def _ensure_worksheets(spreadsheet):
     try:
@@ -100,7 +99,6 @@ def _ensure_worksheets(spreadsheet):
     return ws_data, ws_fp
 
 def load_fingerprints(gc) -> set:
-    """Lê os fingerprints existentes da aba _fingerprints e retorna um set."""
     print("🧩 Carregando fingerprints do Google Sheets...")
     spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
     _, ws_fp = _ensure_worksheets(spreadsheet)
@@ -120,82 +118,94 @@ def append_fingerprints(gc, new_fps: list[str]):
     print(f"🧩 Fingerprints adicionados: {len(new_fps)}")
 
 # =========================
-# Resolvedor de URL final (Selenium → fallback requests)
+# Resolvedor de URL final
 # =========================
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"
 })
 
-UTM_PARAMS = {
+TRACKING_PARAMS = {
     "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-    "utm_id","utm_name","gclid","fbclid","mcid","ocid","igshid"
+    "gclid","fbclid","mc_cid","mc_eid","igshid","si","s","spm","ved","ei"
 }
 
-def _strip_tracking_params(url: str) -> str:
-    """Remove UTM/gclid/fbclid e fragment (#...)."""
+def _strip_tracking(query_pairs):
+    return [(k, v) for (k, v) in query_pairs if k not in TRACKING_PARAMS]
+
+def clean_url(url: str) -> str:
     try:
         p = urlparse(url)
-        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k.lower() not in UTM_PARAMS]
-        clean = p._replace(query=urlencode(q), fragment="")
-        return urlunparse(clean)
+        path = re.sub(r"/amp(/|$)", r"/", p.path)
+        query = urlencode(_strip_tracking(parse_qsl(p.query, keep_blank_values=True)))
+        netloc = p.netloc.replace("amp.", "", 1) if p.netloc.startswith("amp.") else p.netloc
+        return urlunparse((p.scheme, netloc, path, "", query, ""))
     except Exception:
         return url
 
-def _resolve_final_url_requests(url: str) -> str:
-    """Segue redirects; se ainda for news.google.com, tenta canonical/meta refresh e limpa tracking."""
+def canonical_from_html(html: str) -> str | None:
     try:
-        r = SESSION.get(url, allow_redirects=True, timeout=12)
-        final = r.url
-        if "news.google.com" in urlparse(final).netloc:
-            soup = BeautifulSoup(r.text, "html.parser")
-            can = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
-            if can and can.get("href"):
-                final = can["href"]
-            else:
-                meta = soup.find("meta", attrs={"http-equiv": lambda v: v and v.lower() == "refresh"})
-                if meta and "url=" in (meta.get("content") or "").lower():
-                    final = meta["content"].split("url=", 1)[-1].strip()
-        return _strip_tracking_params(final)
+        soup = BeautifulSoup(html, "html.parser")
+        lg = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+        if lg and lg.get("href"):
+            return lg["href"]
+        meta = soup.find("meta", attrs={"http-equiv": re.compile("^refresh$", re.I)})
+        if meta and meta.get("content"):
+            m = re.search(r"url\s*=\s*([^;]+)", meta["content"], flags=re.I)
+            if m:
+                return m.group(1).strip().strip("'").strip('"')
     except Exception:
-        return _strip_tracking_params(url)
+        pass
+    return None
 
-def _resolve_final_url_selenium(driver, url: str) -> str:
-    """Abre em nova aba, espera redirecionar e captura current_url (JS pode estar off)."""
+def resolve_publisher_url(driver, gn_url: str, wait_sec: int = 8) -> str:
+    """
+    Abre a URL do Google News com Selenium e tenta capturar a URL final do veículo.
+    Fallback: requests + canonical/meta-refresh. Sempre retorna uma URL 'limpa'.
+    """
+    # 1) Tentativa via Selenium
     try:
-        orig = driver.current_window_handle
-        driver.switch_to.new_window("tab")
-        driver.get(url)
-        time.sleep(2.0)
-        final = driver.current_url
-        # dá chance para +redirects
-        for _ in range(2):
-            time.sleep(1.0)
-            cur = driver.current_url
-            if cur != final:
-                final = cur
+        original = driver.current_window_handle
+        driver.execute_script("window.open('about:blank','_blank');")
+        driver.switch_to.window(driver.window_handles[-1])
+        driver.get(gn_url)
+
+        try:
+            WebDriverWait(driver, wait_sec).until(
+                lambda d: urlparse(d.current_url).netloc not in ("news.google.com", "consent.google.com")
+            )
+        except Exception:
+            pass
+
+        final_url = driver.current_url
         driver.close()
-        driver.switch_to.window(orig)
-        return _strip_tracking_params(final)
+        driver.switch_to.window(original)
+
+        if urlparse(final_url).netloc not in ("news.google.com", "consent.google.com"):
+            return clean_url(final_url)
+        # se ainda for Google, cai no fallback
     except Exception:
-        # garante voltar pra alguma aba válida
+        try:
+            driver.close()
+        except Exception:
+            pass
         try:
             if driver.window_handles:
                 driver.switch_to.window(driver.window_handles[0])
         except Exception:
             pass
-        return _strip_tracking_params(url)
 
-def resolve_final_url(driver, url: str) -> str:
-    """
-    1) Tenta resolver com Selenium (nova aba).
-    2) Se ainda for news.google.com, faz fallback com requests (canonical/meta refresh).
-    3) Remove utm/gclid/fbclid etc.
-    """
-    first = _resolve_final_url_selenium(driver, url)
-    if "news.google.com" in urlparse(first).netloc:
-        return _resolve_final_url_requests(first)
-    return first
+    # 2) Fallback robusto via requests
+    try:
+        r = SESSION.get(gn_url, allow_redirects=True, timeout=12)
+        if urlparse(r.url).netloc not in ("news.google.com", "consent.google.com"):
+            return clean_url(r.url)
+        can = canonical_from_html(r.text)
+        if can:
+            return clean_url(requests.compat.urljoin(r.url, can))
+        return clean_url(r.url)
+    except Exception:
+        return clean_url(gn_url)
 
 # =========================
 # Scraper
@@ -209,7 +219,7 @@ def scrape_news_for_term(driver, termo):
         driver.get(link)
         time.sleep(3)
 
-        # scroll para carregar
+        # scroll para carregar mais resultados
         print("📜 Fazendo scroll da página...")
         for _ in range(10):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -238,15 +248,14 @@ def scrape_news_for_term(driver, termo):
                 if not link_bruto:
                     continue
 
-                # >>> AQUI: Selenium → fallback requests → limpa tracking
-                url_final = resolve_final_url(driver, link_bruto)
+                url_final = resolve_publisher_url(driver, link_bruto)
 
                 noticias.append({
                     'Título': title.text.strip() if title else 'Título não encontrado',
                     'Fonte': publisher.text.strip() if publisher else 'Fonte não encontrada',
                     'Data de Publicação': dt_utc.astimezone(TZ_BR).strftime('%d/%m/%Y') if dt_utc else 'Data não encontrada',
-                    'Link': link_bruto,          # URL do Google News
-                    'URL Final': url_final,      # URL do veículo (limpa)
+                    'Link': link_bruto,         # Google News
+                    'URL Final': url_final,     # Veículo original
                     'Termo de Busca': termo,
                     'Publicado_UTC': dt_utc
                 })
