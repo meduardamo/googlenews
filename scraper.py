@@ -294,7 +294,7 @@ def read_terms_from_config(sh):
             return termos
     except Exception:
         pass
-    return ['PNE', 'Plano Nacional de Educação', 'Saúde Mental']
+    return ['PNE', 'Plano Nacional de Educação', 'Saúde Mental', 'Adultização']
 
 def ensure_sheet(sh):
     try:
