@@ -18,6 +18,9 @@ from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 import sys
 
+# NEW: utils p/ tratar URLs
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+
 # =========================
 # Utilidades de horário
 # =========================
@@ -45,7 +48,7 @@ def setup_driver():
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-images")
-    options.add_argument("--disable-javascript")
+    options.add_argument("--disable-javascript")  # JS off pode impedir alguns redirects; fallback cobre
 
     # Em Actions, essas flags evitam throttling quando headless
     if os.getenv('GITHUB_ACTIONS'):
@@ -117,20 +120,82 @@ def append_fingerprints(gc, new_fps: list[str]):
     print(f"🧩 Fingerprints adicionados: {len(new_fps)}")
 
 # =========================
-# Resolvedor de URL final
+# Resolvedor de URL final (Selenium → fallback requests)
 # =========================
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"
 })
 
-def resolve_final_url(url: str) -> str:
-    """Segue redirecionamentos e retorna a URL final do site original."""
+UTM_PARAMS = {
+    "utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+    "utm_id","utm_name","gclid","fbclid","mcid","ocid","igshid"
+}
+
+def _strip_tracking_params(url: str) -> str:
+    """Remove UTM/gclid/fbclid e fragment (#...)."""
     try:
-        resp = SESSION.get(url, allow_redirects=True, timeout=12)
-        return resp.url
+        p = urlparse(url)
+        q = [(k, v) for k, v in parse_qsl(p.query, keep_blank_values=True) if k.lower() not in UTM_PARAMS]
+        clean = p._replace(query=urlencode(q), fragment="")
+        return urlunparse(clean)
     except Exception:
-        return url  # fallback
+        return url
+
+def _resolve_final_url_requests(url: str) -> str:
+    """Segue redirects; se ainda for news.google.com, tenta canonical/meta refresh e limpa tracking."""
+    try:
+        r = SESSION.get(url, allow_redirects=True, timeout=12)
+        final = r.url
+        if "news.google.com" in urlparse(final).netloc:
+            soup = BeautifulSoup(r.text, "html.parser")
+            can = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+            if can and can.get("href"):
+                final = can["href"]
+            else:
+                meta = soup.find("meta", attrs={"http-equiv": lambda v: v and v.lower() == "refresh"})
+                if meta and "url=" in (meta.get("content") or "").lower():
+                    final = meta["content"].split("url=", 1)[-1].strip()
+        return _strip_tracking_params(final)
+    except Exception:
+        return _strip_tracking_params(url)
+
+def _resolve_final_url_selenium(driver, url: str) -> str:
+    """Abre em nova aba, espera redirecionar e captura current_url (JS pode estar off)."""
+    try:
+        orig = driver.current_window_handle
+        driver.switch_to.new_window("tab")
+        driver.get(url)
+        time.sleep(2.0)
+        final = driver.current_url
+        # dá chance para +redirects
+        for _ in range(2):
+            time.sleep(1.0)
+            cur = driver.current_url
+            if cur != final:
+                final = cur
+        driver.close()
+        driver.switch_to.window(orig)
+        return _strip_tracking_params(final)
+    except Exception:
+        # garante voltar pra alguma aba válida
+        try:
+            if driver.window_handles:
+                driver.switch_to.window(driver.window_handles[0])
+        except Exception:
+            pass
+        return _strip_tracking_params(url)
+
+def resolve_final_url(driver, url: str) -> str:
+    """
+    1) Tenta resolver com Selenium (nova aba).
+    2) Se ainda for news.google.com, faz fallback com requests (canonical/meta refresh).
+    3) Remove utm/gclid/fbclid etc.
+    """
+    first = _resolve_final_url_selenium(driver, url)
+    if "news.google.com" in urlparse(first).netloc:
+        return _resolve_final_url_requests(first)
+    return first
 
 # =========================
 # Scraper
@@ -173,14 +238,15 @@ def scrape_news_for_term(driver, termo):
                 if not link_bruto:
                     continue
 
-                url_final = resolve_final_url(link_bruto)
+                # >>> AQUI: Selenium → fallback requests → limpa tracking
+                url_final = resolve_final_url(driver, link_bruto)
 
                 noticias.append({
                     'Título': title.text.strip() if title else 'Título não encontrado',
                     'Fonte': publisher.text.strip() if publisher else 'Fonte não encontrada',
                     'Data de Publicação': dt_utc.astimezone(TZ_BR).strftime('%d/%m/%Y') if dt_utc else 'Data não encontrada',
-                    'Link': link_bruto,
-                    'URL Final': url_final,
+                    'Link': link_bruto,          # URL do Google News
+                    'URL Final': url_final,      # URL do veículo (limpa)
                     'Termo de Busca': termo,
                     'Publicado_UTC': dt_utc
                 })
