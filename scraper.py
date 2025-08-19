@@ -7,7 +7,6 @@ import hashlib
 from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse, unquote
 
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -34,6 +33,7 @@ def fmt_brasilia(dt: datetime) -> str:
 # Selenium / Driver
 # =========================
 def setup_driver():
+    """Configura e retorna uma instância do WebDriver usando Selenium Manager (sem webdriver_manager)."""
     print("🔧 Configurando WebDriver (Selenium Manager)...")
     options = Options()
     options.add_argument("--headless=new")
@@ -45,15 +45,22 @@ def setup_driver():
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-images")
-    options.add_argument("--disable-javascript")  # 🔴 agora JS está desativado
+    options.add_argument("--disable-javascript")
 
+    # Em Actions, essas flags evitam throttling quando headless
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
 
-    driver = webdriver.Chrome(options=options)
-    return driver
+    # Se o setup-chrome já pôs o Chrome no PATH, o Selenium Manager resolve o driver certo sozinho
+    try:
+        driver = webdriver.Chrome(options=options)
+        print("✅ WebDriver configurado com sucesso (Selenium Manager)")
+        return driver
+    except Exception as e:
+        print(f"❌ Erro ao configurar WebDriver: {e}")
+        sys.exit(1)
 
 # =========================
 # Fingerprints no Google Sheets
@@ -117,133 +124,13 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"
 })
 
-_TRACKING_PREFIXES = ("utm_",)
-_TRACKING_KEYS = {
-    "gclid", "fbclid", "igshid", "mc_eid", "mc_cid", "cmpid", "ocid", "msclkid", "vero_id",
-    "emcid", "rb_clickid", "rb_ref", "at_medium", "at_campaign", "at_custom1"
-}
-
-def _clean_url(url: str) -> str:
-    try:
-        p = urlparse(url)
-        q = [(k, v) for (k, v) in parse_qsl(p.query, keep_blank_values=True)
-             if not (k.startswith(_TRACKING_PREFIXES) or k in _TRACKING_KEYS)]
-        new_query = urlencode(q, doseq=True)
-        # Remove fragment e normaliza
-        cleaned = urlunparse((p.scheme, p.netloc, p.path, p.params, new_query, ""))
-        return cleaned
-    except Exception:
-        return url
-
-def _extract_refresh_target(html: str) -> str | None:
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        meta = soup.find("meta", attrs={"http-equiv": lambda v: v and v.lower() == "refresh"})
-        if not meta:
-            return None
-        content = meta.get("content", "")
-        # ex: "0;url=https://example.com/path"
-        lower = content.lower()
-        if "url=" in lower:
-            target = content.split("=", 1)[1].strip().strip("'\"")
-            return target
-        return None
-    except Exception:
-        return None
-
-def _extract_canonical(html: str) -> str | None:
-    try:
-        soup = BeautifulSoup(html, "html.parser")
-        link = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
-        if link and link.get("href"):
-            return link["href"].strip()
-        return None
-    except Exception:
-        return None
-
-def _requests_follow(url: str) -> str:
+def resolve_final_url(url: str) -> str:
+    """Segue redirecionamentos e retorna a URL final do site original."""
     try:
         resp = SESSION.get(url, allow_redirects=True, timeout=12)
-        final_url = resp.url
-
-        # alguns links do Google News chegam como "...?url=https%3A%2F%2Fsite.com%2Fmateria"
-        if "news.google.com" in urlparse(final_url).netloc:
-            parsed = urlparse(final_url)
-            qs = dict(parse_qsl(parsed.query))
-            if "url" in qs:
-                candidate = unquote(qs["url"])
-                if candidate:
-                    final_url = candidate
-
-        # tentar canonical/meta refresh se ainda for intersticial
-        try:
-            html = resp.text
-        except Exception:
-            html = ""
-
-        canonical = _extract_canonical(html)
-        if canonical:
-            final_url = canonical
-
-        refresh = _extract_refresh_target(html)
-        if refresh:
-            # segue o refresh uma vez
-            r2 = SESSION.get(refresh, allow_redirects=True, timeout=12)
-            final_url = r2.url
-
-        return _clean_url(final_url)
+        return resp.url
     except Exception:
-        return _clean_url(url)
-
-def _selenium_follow(driver, url: str, max_wait_s: int = 10) -> str:
-    """Abre o link em nova aba, aguarda redirecionamento e retorna current_url."""
-    original = driver.current_window_handle
-    # abrir nova aba
-    driver.switch_to.new_window('tab')
-    try:
-        driver.get(url)
-        start = time.time()
-        last = ""
-        while time.time() - start < max_wait_s:
-            cur = driver.current_url
-            # espera “estabilizar” (parar de mudar) e sair de news.google.com
-            if cur == last:
-                break
-            last = cur
-            if "news.google.com" not in urlparse(cur).netloc and len(cur) > 10:
-                # deu boa, já saiu do domínio do Google News
-                break
-            time.sleep(0.5)
-        final_url = driver.current_url
-        return _clean_url(final_url)
-    finally:
-        # fecha aba e volta
-        try:
-            driver.close()
-        except Exception:
-            pass
-        # voltar para a janela original (se existir)
-        try:
-            driver.switch_to.window(original)
-        except Exception:
-            pass
-
-def resolve_final_url(url: str, driver: webdriver.Chrome | None = None) -> str:
-    """
-    Primeiro tenta via Selenium (abrindo em nova aba e lendo current_url).
-    Se ainda ficar em news.google.com ou falhar, cai no fallback via requests,
-    tentando também canonical/meta refresh.
-    """
-    try:
-        if driver is not None:
-            final_by_selenium = _selenium_follow(driver, url, max_wait_s=12)
-            if final_by_selenium and "news.google.com" not in urlparse(final_by_selenium).netloc:
-                return final_by_selenium
-    except Exception as e:
-        print(f"⚠️ Selenium fallback para requests (motivo: {e})")
-
-    # fallback
-    return _requests_follow(url)
+        return url  # fallback
 
 # =========================
 # Scraper
@@ -268,7 +155,6 @@ def scrape_news_for_term(driver, termo):
 
         noticias = []
         root = 'https://news.google.com'
-
         for item in news_items:
             try:
                 title = item.find('a', class_='JtKRv') or item.find('h3') or item.find('h4')
@@ -287,16 +173,13 @@ def scrape_news_for_term(driver, termo):
                 if not link_bruto:
                     continue
 
-                # URL Final de verdade (Selenium -> Requests fallback)
-                url_final = resolve_final_url(link_bruto, driver=driver)
+                url_final = resolve_final_url(link_bruto)
 
                 noticias.append({
                     'Título': title.text.strip() if title else 'Título não encontrado',
                     'Fonte': publisher.text.strip() if publisher else 'Fonte não encontrada',
                     'Data de Publicação': dt_utc.astimezone(TZ_BR).strftime('%d/%m/%Y') if dt_utc else 'Data não encontrada',
-                    # Link do Google News (mantemos)
-                    'Link': _clean_url(link_bruto),
-                    # URL do veículo original (resolvida)
+                    'Link': link_bruto,
                     'URL Final': url_final,
                     'Termo de Busca': termo,
                     'Publicado_UTC': dt_utc
@@ -304,7 +187,6 @@ def scrape_news_for_term(driver, termo):
             except Exception as e:
                 print(f"⚠️ Erro ao processar notícia: {e}")
                 continue
-
         return noticias
     except Exception as e:
         print(f"❌ Erro ao fazer scraping para '{termo}': {e}")
@@ -316,8 +198,8 @@ def filter_recent_24h(df_noticias):
         return pd.DataFrame()
     if 'Publicado_UTC' not in df_noticias.columns:
         df_noticias['Publicado_UTC'] = pd.NaT
-    now_utc = datetime.now(timezone.utc)
 
+    now_utc = datetime.now(timezone.utc)
     def _in_24h(val):
         if pd.isna(val):
             return True
@@ -411,6 +293,7 @@ def main():
                 new_fps = df_geral_final['__fp'].tolist()
             except Exception as e:
                 print(f"⚠️ Não foi possível usar fingerprints remotos (seguindo sem): {e}")
+
             if '__fp' in df_geral_final.columns:
                 df_geral_final.drop(columns=['__fp'], inplace=True)
 
@@ -431,7 +314,7 @@ def main():
         print(f"📤 Google Sheets atualizado: {'✅' if sheets_uploaded else '❌'}")
         if total_noticias == 0:
             print("⚠️ Nenhuma notícia nova encontrada nas últimas 24h (após deduplicação).")
-        sys.exit(0)
+            sys.exit(0)
     except Exception as e:
         print(f"❌ Erro geral na execução: {e}")
         sys.exit(1)
