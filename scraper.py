@@ -34,9 +34,13 @@ def fmt_brasilia(dt: datetime) -> str:
 # =========================
 # Selenium / Driver
 # =========================
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+# ↓ não precisa mais do Service / webdriver_manager
+
 def setup_driver():
-    """Configura e retorna uma instância do WebDriver"""
-    print("🔧 Configurando WebDriver...")
+    """Configura e retorna uma instância do WebDriver usando Selenium Manager (sem webdriver_manager)."""
+    print("🔧 Configurando WebDriver (Selenium Manager)...")
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -49,20 +53,16 @@ def setup_driver():
     options.add_argument("--disable-images")
     options.add_argument("--disable-javascript")
 
+    # Em Actions, essas flags evitam throttling quando headless
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
 
-    chrome_path = shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("chromium")
-    if chrome_path:
-        options.binary_location = chrome_path
-        print(f"✅ Chrome encontrado em: {chrome_path}")
-
+    # Se o setup-chrome já pôs o Chrome no PATH, o Selenium Manager resolve o driver certo sozinho
     try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        print("✅ WebDriver configurado com sucesso")
+        driver = webdriver.Chrome(options=options)
+        print("✅ WebDriver configurado com sucesso (Selenium Manager)")
         return driver
     except Exception as e:
         print(f"❌ Erro ao configurar WebDriver: {e}")
