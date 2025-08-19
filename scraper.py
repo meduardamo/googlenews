@@ -22,13 +22,14 @@ SPREADSHEET_KEY = (
     or os.getenv("PLANILHA")  # aceita secret chamado "planilha"
 )
 
-TAB_NOTICIAS = "google notícias"   # única aba usada pelo projeto
-TAB_CONFIG  = "Config"             # opcional (colunas: Termo, Ativo)
+TAB_NOTICIAS = "google notícias"
+TAB_CONFIG  = "Config"
+
+WINDOW_DAYS = int(os.getenv("WINDOW_DAYS", "1"))  # 1=últimas 24h, 7=última semana...
 
 HTTP_TIMEOUT = 12
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
 
-# colunas exportadas para a planilha (sem Fingerprint nem histórico)
 EXPORT_COLS = [
     "URL Final","URL GoogleNews","Título","Fonte",
     "Termo","Data de Publicação","Dominio","Coletado em"
@@ -70,7 +71,6 @@ def setup_driver():
     options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    # não desabilitar JS: GNews precisa de JS
 
     chrome_path = shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("chromium")
     if chrome_path:
@@ -97,7 +97,6 @@ def strip_tracking_params(url: str) -> str:
         return url
 
 def url_fingerprint(url: str) -> str:
-    """domínio + path (sem query/fragment) para dedup estável."""
     try:
         p = urlparse(url)
         base = urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
@@ -106,7 +105,6 @@ def url_fingerprint(url: str) -> str:
         return url.lower()
 
 def resolve_final_url_requests(url: str) -> str:
-    """Fallback via requests (segue redirects + tenta canonical/meta refresh)."""
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True, headers={"User-Agent": USER_AGENT})
         final = r.url
@@ -124,14 +122,13 @@ def resolve_final_url_requests(url: str) -> str:
         return strip_tracking_params(url)
 
 def resolve_final_url_selenium(driver, url: str) -> str:
-    """Abre o link do Google News numa nova aba e captura a URL destino real."""
     try:
         orig = driver.current_window_handle
         driver.switch_to.new_window("tab")
         driver.get(url)
-        time.sleep(2.5)  # espera redirects/client-side
+        time.sleep(2.5)
         final = driver.current_url
-        for _ in range(2):  # pequenas esperas extras
+        for _ in range(2):
             time.sleep(1.5)
             cur = driver.current_url
             if cur != final:
@@ -151,7 +148,6 @@ def resolve_final_url_selenium(driver, url: str) -> str:
         return resolve_final_url_requests(url)
 
 def fetch_publisher_title(final_url: str) -> str:
-    """Tenta pegar o título do site de origem (og:title / twitter:title / <title>)."""
     try:
         r = requests.get(final_url, timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
         r.raise_for_status()
@@ -170,12 +166,12 @@ def fetch_publisher_title(final_url: str) -> str:
 # SCRAPER
 # =========================
 def scrape_news_for_term(driver, termo, coletado_em_str: str):
-    q = termo.replace(" ", "+")
+    termo_periodo = f"{termo} when:{WINDOW_DAYS}d"
+    q = termo_periodo.replace(" ", "+")
     link = f"https://news.google.com/search?q={q}&hl=pt-BR&gl=BR&ceid=BR%3Apt-419"
     driver.get(link)
     time.sleep(3)
 
-    # scroll até carregar tudo
     last_h = driver.execute_script("return document.body.scrollHeight")
     for _ in range(12):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -186,7 +182,6 @@ def scrape_news_for_term(driver, termo, coletado_em_str: str):
         last_h = new_h
 
     soup = BeautifulSoup(driver.page_source, "html.parser")
-    # preferir artigos com h3/h4 -> a (evita tópicos/edições)
     items = soup.select("article:has(h3 a), article:has(h4 a)")
     base = "https://news.google.com"
 
@@ -197,27 +192,20 @@ def scrape_news_for_term(driver, termo, coletado_em_str: str):
             a = h.find("a", href=True) if h else None
             title = a.get_text(strip=True) if a else (h.get_text(strip=True) if h else None)
             href = a["href"] if a else None
-            if not href:
-                continue
+            if not href: continue
 
-            # normaliza link relativo do GNews
-            if href.startswith("./"):
-                href = base + href[1:]
-            elif href.startswith("/"):
-                href = base + href
+            if href.startswith("./"): href = base + href[1:]
+            elif href.startswith("/"): href = base + href
 
-            # descarte páginas de cluster do próprio GNews
             parsed = urlparse(href)
             if "news.google.com" in parsed.netloc and any(
                 seg in parsed.path for seg in ("/topics", "/publications", "/headlines", "/stories")
             ):
                 continue
 
-            # publisher/fonte
             pub = it.find("div", class_="vr1PYe") or it.find("div", class_="wsLqz")
             fonte = pub.get_text(strip=True) if pub else ""
 
-            # data (string dd/mm/aaaa)
             t = it.find("time")
             dt_pub = ""
             if t and t.get("datetime"):
@@ -227,12 +215,10 @@ def scrape_news_for_term(driver, termo, coletado_em_str: str):
                 except Exception:
                     dt_pub = ""
 
-            # URL final real
             url_final = resolve_final_url_selenium(driver, href)
             dominio   = urlparse(url_final).netloc if url_final else ""
             fp        = url_fingerprint(url_final)
 
-            # Corrigir título se for genérico do cluster
             needs_real_title = (
                 not title
                 or title.lower().startswith("notícias sobre")
@@ -241,10 +227,8 @@ def scrape_news_for_term(driver, termo, coletado_em_str: str):
             )
             if needs_real_title:
                 real = fetch_publisher_title(url_final)
-                if real:
-                    title = real
-            if not title:
-                continue  # evita linha feia
+                if real: title = real
+            if not title: continue
 
             rows.append({
                 "URL Final": url_final,
@@ -255,115 +239,75 @@ def scrape_news_for_term(driver, termo, coletado_em_str: str):
                 "Data de Publicação": dt_pub,
                 "Dominio": dominio,
                 "Coletado em": coletado_em_str,
-                # campos só internos (não exportados)
                 "_Fingerprint": fp
             })
         except Exception:
             continue
-
     return pd.DataFrame(rows)
 
-# — filtro últimas 24h (robusto para tz-aware)
-def filter_last_24h(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    d = pd.to_datetime(df["Data de Publicação"], format="%d/%m/%Y", errors="coerce")
-    now = pd.Timestamp.utcnow()
-    if now.tzinfo is None:
-        now = now.tz_localize("UTC")
-    try:
-        d = d.dt.tz_localize("UTC")
-    except (TypeError, AttributeError):
-        d = d.dt.tz_convert("UTC")
-    mask = (d.isna()) | (now.normalize() - d <= pd.Timedelta(days=1))
-    return df[mask].copy()
-
 # =========================
-# SHEETS I/O (uma aba + append de novos)
+# SHEETS I/O
 # =========================
 def read_terms_from_config(sh):
     try:
         ws = sh.worksheet(TAB_CONFIG)
         dfc = pd.DataFrame(ws.get_all_records())
-        if dfc.empty or "Termo" not in dfc.columns:
-            raise ValueError
+        if dfc.empty or "Termo" not in dfc.columns: raise ValueError
         if "Ativo" in dfc.columns:
             dfc = dfc[dfc["Ativo"].astype(str).str.lower().isin(["true","1","sim","yes","y"])]
         termos = [t for t in dfc["Termo"].astype(str).str.strip().tolist() if t]
-        if termos:
-            return termos
+        if termos: return termos
     except Exception:
         pass
-    return ['PNE', 'Plano Nacional de Educação', 'Saúde Mental', 'Adultização']
+    return ['PNE','Plano Nacional de Educação','Saúde Mental']
 
 def ensure_sheet(sh):
-    try:
-        return sh.worksheet(TAB_NOTICIAS)
-    except gspread.WorksheetNotFound:
-        return sh.add_worksheet(title=TAB_NOTICIAS, rows="2000", cols="30")
+    try: return sh.worksheet(TAB_NOTICIAS)
+    except gspread.WorksheetNotFound: return sh.add_worksheet(title=TAB_NOTICIAS, rows="2000", cols="30")
 
 def normalize_missing_cols(df: pd.DataFrame, required_cols) -> pd.DataFrame:
     df = df.copy()
     for c in required_cols:
-        if c not in df.columns:
-            df[c] = ""
+        if c not in df.columns: df[c] = ""
     return df
 
 def upsert_append_only(sh, df_day: pd.DataFrame):
-    """
-    Acrescenta apenas itens cujo fingerprint (derivado da URL Final) ainda não exista na planilha.
-    Preserva colunas manuais já existentes.
-    """
     ws = ensure_sheet(sh)
     existing = pd.DataFrame(ws.get_all_records())
     existing = normalize_missing_cols(existing, EXPORT_COLS)
 
-    # set de fingerprints já presentes (derivados da URL Final salva)
     if existing.empty:
         seen_fps = set()
     else:
-        try:
-            seen_fps = set(existing["URL Final"].map(url_fingerprint).astype(str).tolist())
-        except Exception:
-            seen_fps = set()
+        try: seen_fps = set(existing["URL Final"].map(url_fingerprint).astype(str).tolist())
+        except Exception: seen_fps = set()
 
-    # separa novos (com base no fingerprint interno)
     df_day = df_day.copy()
-    df_day["_Fingerprint"] = df_day["_Fingerprint"].astype(str)
     novos = df_day[~df_day["_Fingerprint"].map(lambda x: x in seen_fps)].copy()
 
-    # prepara saída: só colunas exportadas
     for c in EXPORT_COLS:
-        if c not in novos.columns:
-            novos[c] = ""
+        if c not in novos.columns: novos[c] = ""
     novos = novos[EXPORT_COLS]
 
     if existing.empty or not set(EXPORT_COLS).issubset(existing.columns):
         out = novos.copy()
-        # Ordena mais recentes no topo
         parsed = pd.to_datetime(out["Coletado em"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-        out = out.assign(_ord=parsed).sort_values("_ord", ascending=False, na_position="last").drop(columns=["_ord"])
+        out = out.assign(_ord=parsed).sort_values("_ord", ascending=False).drop(columns=["_ord"])
         set_with_dataframe(ws, out)
         print(f"🧾 Inseridos {len(out)} itens (primeira carga).")
         return
 
-    # preserva colunas manuais
     manual_cols = [c for c in existing.columns if c not in EXPORT_COLS]
     for c in manual_cols:
-        if c not in novos.columns:
-            novos[c] = ""
-
-    ordered_cols = EXPORT_COLS + manual_cols + [c for c in existing.columns if c not in EXPORT_COLS + manual_cols]
+        if c not in novos.columns: novos[c] = ""
+    ordered_cols = EXPORT_COLS + manual_cols + [c for c in existing.columns if c not in EXPORT_COLS+manual_cols]
     for c in ordered_cols:
-        if c not in existing.columns:
-            existing[c] = ""
-
+        if c not in existing.columns: existing[c] = ""
     existing = existing[ordered_cols]
     updated = pd.concat([existing, novos[ordered_cols]], ignore_index=True)
 
-    # ordena por coleta desc
     parsed = pd.to_datetime(updated["Coletado em"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-    updated = updated.assign(_ord=parsed).sort_values("_ord", ascending=False, na_position="last").drop(columns=["_ord"])
+    updated = updated.assign(_ord=parsed).sort_values("_ord", ascending=False).drop(columns=["_ord"])
 
     set_with_dataframe(ws, updated)
     print(f"✅ Append | novos: {len(novos)} | total: {len(updated)}")
@@ -378,28 +322,16 @@ def main():
 
     driver = setup_driver()
     try:
-        dfs = []
-        for termo in termos:
-            df = scrape_news_for_term(driver, termo, coletado_em_str)
-            df = filter_last_24h(df)
-            dfs.append(df)
-
+        dfs = [scrape_news_for_term(driver, termo, coletado_em_str) for termo in termos]
         df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         if df_all.empty:
-            print("⚠️ Nenhuma notícia encontrada nas últimas 24h.")
+            print("⚠️ Nenhuma notícia encontrada no período.")
             return
-
-        # dedup dentro da própria execução (mesmo artigo/termo/fonte)
         for c in ["_Fingerprint","Termo","Fonte","Título"]:
-            if c not in df_all.columns:
-                df_all[c] = ""
+            if c not in df_all.columns: df_all[c] = ""
         df_all = df_all.drop_duplicates(subset=["_Fingerprint","Termo","Fonte","Título"])
-
-        # garante colunas exportadas
         for c in EXPORT_COLS:
-            if c not in df_all.columns:
-                df_all[c] = ""
-
+            if c not in df_all.columns: df_all[c] = ""
         upsert_append_only(sh, df_all)
     finally:
         driver.quit()
