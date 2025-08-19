@@ -1,4 +1,4 @@
-name: 📰 Monitor de Notícias - Google News
+name: Monitor de Notícias - Google News
 
 on:
   schedule:
