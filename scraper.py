@@ -1,11 +1,5 @@
 # -*- coding: utf-8 -*-
-import os
-import re
-import json
-import time
-import shutil
-import sys
-import requests
+import os, re, json, time, shutil, sys, requests
 import pandas as pd
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone
@@ -25,11 +19,10 @@ from google.oauth2.service_account import Credentials
 # =========================
 SPREADSHEET_KEY = (
     os.getenv("SPREADSHEET_KEY")
-    or os.getenv("PLANILHA")  # <- aceita secret chamado planilha
+    or os.getenv("PLANILHA")  # aceita secret chamado "planilha"
 )
-
-TAB_NOTICIAS = "google notícias"  # única aba
-TAB_CONFIG = "Config"             # opcional (coluna Termo, Ativo TRUE/FALSE)
+TAB_NOTICIAS = "google notícias"   # única aba
+TAB_CONFIG  = "Config"             # opcional (colunas: Termo, Ativo)
 
 HTTP_TIMEOUT = 12
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
@@ -38,6 +31,9 @@ CORE_COLS = [
     "Fingerprint","URL Final","URL GoogleNews","Título","Fonte","Termo",
     "Data de Publicação","Dominio","Primeiro Visto","Último Visto","Vezes Visto"
 ]
+
+UTM_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content",
+              "utm_id","utm_name","gclid","fbclid","mcid","ocid","igshid"}
 
 # =========================
 # AUTH GOOGLE SHEETS
@@ -87,9 +83,6 @@ def setup_driver():
 # =========================
 # URL helpers
 # =========================
-UTM_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content",
-              "utm_id","utm_name","gclid","fbclid","mcid","ocid","igshid"}
-
 def strip_tracking_params(url: str) -> str:
     try:
         p = urlparse(url)
@@ -101,6 +94,7 @@ def strip_tracking_params(url: str) -> str:
         return url
 
 def resolve_final_url(url: str) -> str:
+    """Segue redirects até o publisher e limpa UTMs."""
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True, headers={"User-Agent": USER_AGENT})
         final = r.url
@@ -109,6 +103,7 @@ def resolve_final_url(url: str) -> str:
         return strip_tracking_params(url)
 
 def url_fingerprint(url: str) -> str:
+    """domínio + path (sem query/fragment) para dedup estável."""
     try:
         p = urlparse(url)
         base = urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
@@ -180,34 +175,30 @@ def scrape_news_for_term(driver, termo):
 
     return pd.DataFrame(rows)
 
+# — filtro últimas 24h (robusto para tz-aware)
 def filter_last_24h(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     d = pd.to_datetime(df["Data de Publicação"], format="%d/%m/%Y", errors="coerce")
-    now = pd.Timestamp.utcnow()  # já vem com tz=UTC
+    now = pd.Timestamp.utcnow()
     if now.tzinfo is None:
         now = now.tz_localize("UTC")
-
-    # garante que d é tz-aware
     try:
         d = d.dt.tz_localize("UTC")
     except (TypeError, AttributeError):
-        # se já for tz-aware, converte
         d = d.dt.tz_convert("UTC")
-
     mask = (d.isna()) | (now.normalize() - d <= pd.Timedelta(days=1))
     return df[mask].copy()
 
-
 # =========================
-# SHEETS: termos + upsert
+# SHEETS I/O
 # =========================
 def read_terms_from_config(sh):
     try:
         ws = sh.worksheet(TAB_CONFIG)
         dfc = pd.DataFrame(ws.get_all_records())
         if dfc.empty or "Termo" not in dfc.columns:
-            raise ValueError("Aba Config vazia ou sem coluna 'Termo'.")
+            raise ValueError
         if "Ativo" in dfc.columns:
             dfc = dfc[dfc["Ativo"].astype(str).str.lower().isin(["true","1","sim","yes","y"])]
         termos = [t for t in dfc["Termo"].astype(str).str.strip().tolist() if t]
@@ -223,30 +214,51 @@ def ensure_sheet(sh):
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=TAB_NOTICIAS, rows="2000", cols="30")
 
+def normalize_missing_cols(df: pd.DataFrame, required_cols) -> pd.DataFrame:
+    """Garante que DF tenha todas as colunas requeridas (preenche vazias)."""
+    df = df.copy()
+    for c in required_cols:
+        if c not in df.columns:
+            df[c] = "" if c != "Vezes Visto" else 0
+    return df
+
 def prepare_new_rows(df_day: pd.DataFrame, coletado_em_str: str) -> pd.DataFrame:
     if df_day.empty:
         return df_day
     df = df_day.copy()
-    df["Dominio"] = df["URL Final"].apply(lambda u: urlparse(str(u)).netloc if pd.notna(u) else "")
+    # Dominio
+    df["Dominio"] = df.get("URL Final", "").apply(lambda u: urlparse(str(u)).netloc if pd.notna(u) and str(u) else "")
+    # métricas iniciais
     df["Primeiro Visto"] = coletado_em_str
-    df["Último Visto"] = coletado_em_str
-    df["Vezes Visto"] = 1
-    for c in CORE_COLS:
-        if c not in df.columns:
-            df[c] = "" if c != "Vezes Visto" else 1
-    return df[CORE_COLS + [c for c in df.columns if c not in CORE_COLS]]
+    df["Último Visto"]  = coletado_em_str
+    df["Vezes Visto"]   = 1
+    # garante colunas core (inclusive Fingerprint)
+    df = normalize_missing_cols(df, CORE_COLS)
+    # ordena colunas (CORE primeiro)
+    extra_cols = [c for c in df.columns if c not in CORE_COLS]
+    return df[CORE_COLS + extra_cols]
 
 def upsert_google_noticias(sh, df_day: pd.DataFrame, coletado_em_str: str):
     ws = ensure_sheet(sh)
+
+    # lê existente; se não houver header, get_all_records() devolve []
     existing = pd.DataFrame(ws.get_all_records())
+    # normaliza colunas core no existente (EVITA KeyError se folha foi criada manualmente)
+    existing = normalize_missing_cols(existing, CORE_COLS)
+
     new_rows = prepare_new_rows(df_day, coletado_em_str)
 
-    if existing.empty:
-        set_with_dataframe(ws, new_rows.sort_values("Último Visto", ascending=False))
+    # primeira carga (sem headers válidos)
+    if existing.empty or not set(CORE_COLS).issubset(existing.columns):
+        out = new_rows.sort_values("Último Visto", ascending=False)
+        set_with_dataframe(ws, out)
+        print(f"🧾 Inseridos {len(out)} itens (primeira carga).")
         return
 
+    # colunas manuais preservadas (quaisquer colunas não-core já existentes)
     manual_cols = [c for c in existing.columns if c not in CORE_COLS]
 
+    # tipos
     existing["Fingerprint"] = existing["Fingerprint"].astype(str)
     new_rows["Fingerprint"] = new_rows["Fingerprint"].astype(str)
 
@@ -254,16 +266,27 @@ def upsert_google_noticias(sh, df_day: pd.DataFrame, coletado_em_str: str):
     novos = new_rows[~new_rows["Fingerprint"].isin(seen)].copy()
     repetidos = new_rows[new_rows["Fingerprint"].isin(seen)].copy()
 
+    # atualiza métricas dos repetidos
     if not repetidos.empty:
         rep_map = repetidos.set_index("Fingerprint")
         idx = existing["Fingerprint"].isin(rep_map.index)
+        # Último Visto
         existing.loc[idx, "Último Visto"] = coletado_em_str
+        # Vezes Visto
         existing.loc[idx, "Vezes Visto"] = pd.to_numeric(existing.loc[idx, "Vezes Visto"], errors="coerce").fillna(0).astype(int) + 1
+        # preencher campos vazios (se houver)
+        for col in ["URL Final","URL GoogleNews","Título","Fonte","Termo","Data de Publicação","Dominio"]:
+            existing.loc[idx, col] = existing.loc[idx, col].where(
+                existing.loc[idx, col].astype(str).str.len() > 0,
+                rep_map.loc[existing.loc[idx, "Fingerprint"], col].values
+            )
 
+    # completa colunas manuais nos novos
     for c in manual_cols:
         if c not in novos.columns:
             novos[c] = ""
 
+    # ordem de colunas de saída
     ordered_cols = CORE_COLS + manual_cols + [c for c in existing.columns if c not in CORE_COLS + manual_cols]
     for c in ordered_cols:
         if c not in existing.columns:
@@ -271,11 +294,14 @@ def upsert_google_noticias(sh, df_day: pd.DataFrame, coletado_em_str: str):
     existing = existing[ordered_cols]
 
     updated = pd.concat([existing, novos[ordered_cols]], ignore_index=True)
+
+    # ordena por Último Visto desc (seguro mesmo se tiver strings)
     if "Último Visto" in updated.columns:
         parsed = pd.to_datetime(updated["Último Visto"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
-        updated = updated.assign(_ord=parsed).sort_values("_ord", ascending=False).drop(columns=["_ord"])
+        updated = updated.assign(_ord=parsed).sort_values("_ord", ascending=False, na_position="last").drop(columns=["_ord"])
 
     set_with_dataframe(ws, updated)
+    print(f"✅ Upsert | novos: {len(novos)} | atualizados: {len(repetidos)} | total: {len(updated)}")
 
 # =========================
 # MAIN
@@ -298,10 +324,21 @@ def main():
             print("⚠️ Nenhuma notícia encontrada nas últimas 24h.")
             return
 
-        df_all["URL Final"] = df_all["URL Final"].fillna(df_all["URL GoogleNews"])
-        df_all["Fingerprint"] = df_all["Fingerprint"].fillna(df_all["URL Final"]).astype(str)
+        # robustez: garante colunas essenciais antes do upsert
+        if "URL Final" not in df_all.columns:
+            df_all["URL Final"] = df_all.get("URL GoogleNews", "")
+        if "Fingerprint" not in df_all.columns:
+            df_all["Fingerprint"] = df_all["URL Final"].apply(url_fingerprint)
+
+        df_all["Fingerprint"] = df_all["Fingerprint"].fillna("").astype(str)
         df_all = df_all[df_all["Fingerprint"].str.len() > 0]
-        df_all = df_all.drop_duplicates(subset=["Fingerprint","Termo","Fonte","Título"])
+
+        # dedup por artigo/termo/fonte
+        keep_cols = ["Fingerprint","Termo","Fonte","Título"]
+        for c in keep_cols:
+            if c not in df_all.columns:
+                df_all[c] = ""
+        df_all = df_all.drop_duplicates(subset=keep_cols)
 
         upsert_google_noticias(sh, df_all, coletado_em_str)
     finally:
