@@ -130,14 +130,14 @@ SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"
 })
 
-def resolve_final_url(url: str) -> str:
-    """Segue redirecionamentos e retorna a URL final do site original."""
+def resolve_final_url(driver, url: str) -> str:
+    """Abre o link do Google News no navegador e pega a URL final redirecionada."""
     try:
-        # alguns hosts rejeitam HEAD; tentamos GET leve
-        resp = SESSION.get(url, allow_redirects=True, timeout=12)
-        return resp.url
+        driver.get(url)
+        time.sleep(2)  # dá tempo pro redirect acontecer
+        return driver.current_url
     except Exception:
-        return url  # fallback
+        return url
 
 # =========================
 # Scraper
@@ -183,7 +183,7 @@ def scrape_news_for_term(driver, termo):
                     continue
 
                 # URL final resolvida
-                url_final = resolve_final_url(link_bruto)
+                url_final = resolve_final_url(driver, link_bruto)
 
                 noticia = {
                     'Título': title.text.strip() if title else 'Título não encontrado',
