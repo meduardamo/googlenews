@@ -2,8 +2,7 @@ name: Scraper Google Notícias
 
 on:
   schedule:
-    # executa a cada 6 horas
-    - cron: '0 */6 * * *'
+    - cron: '0 */6 * * *'   # a cada 6 horas
   workflow_dispatch:
   push:
     branches: [ main ]
@@ -43,6 +42,6 @@ jobs:
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
-          SPREADSHEET_KEY: ${{ secrets.SPREADSHEET_KEY }}
+          SPREADSHEET_KEY: ${{ secrets.planilha }}   # usa o secret chamado planilha
         run: |
           python scraper.py
