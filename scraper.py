@@ -181,12 +181,23 @@ def scrape_news_for_term(driver, termo):
     return pd.DataFrame(rows)
 
 def filter_last_24h(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: 
+    if df.empty:
         return df
     d = pd.to_datetime(df["Data de Publicação"], format="%d/%m/%Y", errors="coerce")
-    now = pd.Timestamp.utcnow().tz_localize("UTC")
-    mask = (d.isna()) | (now.normalize() - d.dt.tz_localize("UTC", nonexistent="shift_forward", ambiguous="NaT") <= pd.Timedelta(days=1))
+    now = pd.Timestamp.utcnow()  # já vem com tz=UTC
+    if now.tzinfo is None:
+        now = now.tz_localize("UTC")
+
+    # garante que d é tz-aware
+    try:
+        d = d.dt.tz_localize("UTC")
+    except (TypeError, AttributeError):
+        # se já for tz-aware, converte
+        d = d.dt.tz_convert("UTC")
+
+    mask = (d.isna()) | (now.normalize() - d <= pd.Timedelta(days=1))
     return df[mask].copy()
+
 
 # =========================
 # SHEETS: termos + upsert
