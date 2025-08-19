@@ -26,7 +26,7 @@ jobs:
       - name: 📦 Instalar dependências
         run: |
           pip install --upgrade pip
-          pip install pandas selenium beautifulsoup4 tqdm gspread gspread-dataframe google-auth webdriver-manager openpyxl requests
+          pip install -r requirements.txt
 
       - name: 🌐 Setup Chrome
         uses: browser-actions/setup-chrome@v1
