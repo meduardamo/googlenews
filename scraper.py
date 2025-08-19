@@ -17,10 +17,22 @@ from google.oauth2.service_account import Credentials
 import sys
 
 # =========================
-# Utilidades de horário
+# Config e Constantes
 # =========================
 TZ_BR = ZoneInfo("America/Sao_Paulo")
 
+SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
+WORKSHEET_DATA = 'google notícias'
+WORKSHEET_FP = '_fingerprints'  # armazena fp e timestamp
+
+HEADERS_DATA = ['Título','Fonte','Data de Publicação','Link','URL Final','Termo de Busca','Coletado em']
+HEADERS_FP   = ['fp','created_at_brt']
+
+SEARCH_TERMS = ['PNE', 'Plano Nacional de Educação', 'Saúde Mental']
+
+# =========================
+# Utilidades de horário
+# =========================
 def agora_brasilia():
     return datetime.now(tz=TZ_BR)
 
@@ -56,7 +68,7 @@ def setup_driver():
         sys.exit(1)
 
 # =========================
-# Google Sheets
+# Google Sheets helpers
 # =========================
 def _gspread_client_from_env():
     raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
@@ -72,20 +84,32 @@ def _gspread_client_from_env():
     ])
     return gspread.authorize(creds)
 
-SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
-WORKSHEET_DATA = 'google notícias'
-WORKSHEET_FP = '_fingerprints'  # armazena fp e timestamp
+def _col_letter(n_cols: int) -> str:
+    # como temos poucas colunas, um conversor simples (1->A, 7->G)
+    return chr(64 + n_cols)
 
 def _ensure_worksheets(spreadsheet):
+    # DATA
     try:
         ws_data = spreadsheet.worksheet(WORKSHEET_DATA)
     except gspread.WorksheetNotFound:
-        ws_data = spreadsheet.add_worksheet(title=WORKSHEET_DATA, rows="100", cols="20")
+        ws_data = spreadsheet.add_worksheet(title=WORKSHEET_DATA, rows="100", cols=str(len(HEADERS_DATA)))
+        ws_data.update(f'A1:{_col_letter(len(HEADERS_DATA))}1', [HEADERS_DATA])  # cabeçalho
+    # garante cabeçalho mesmo se a aba já existia sem header correto
+    first_row = ws_data.row_values(1)
+    if [c.strip().lower() for c in first_row] != [c.lower() for c in HEADERS_DATA]:
+        ws_data.update(f'A1:{_col_letter(len(HEADERS_DATA))}1', [HEADERS_DATA])
+
+    # FINGERPRINTS
     try:
         ws_fp = spreadsheet.worksheet(WORKSHEET_FP)
     except gspread.WorksheetNotFound:
-        ws_fp = spreadsheet.add_worksheet(title=WORKSHEET_FP, rows="100", cols="2")
-        ws_fp.update('A1:B1', [['fp', 'created_at_brt']])
+        ws_fp = spreadsheet.add_worksheet(title=WORKSHEET_FP, rows="100", cols=str(len(HEADERS_FP)))
+        ws_fp.update(f'A1:{_col_letter(len(HEADERS_FP))}1', [HEADERS_FP])        # cabeçalho
+    first_row_fp = ws_fp.row_values(1)
+    if [c.strip().lower() for c in first_row_fp] != [c.lower() for c in HEADERS_FP]:
+        ws_fp.update(f'A1:{_col_letter(len(HEADERS_FP))}1', [HEADERS_FP])
+
     return ws_data, ws_fp
 
 def load_fingerprints(gc) -> set:
@@ -108,24 +132,18 @@ def append_fingerprints(gc, new_fps: list[str]):
     print(f"🧩 Fingerprints adicionados: {len(new_fps)}")
 
 def append_news_rows(gc, df_novos: pd.DataFrame):
-    """Append na aba 'google notícias' (com cabeçalho se necessário)."""
+    """Append na aba 'google notícias' (com cabeçalho garantido)."""
     if df_novos.empty:
         print("ℹ️ Nada novo para adicionar na aba de dados.")
         return
     spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
     ws_data, _ = _ensure_worksheets(spreadsheet)
 
-    header = ['Título','Fonte','Data de Publicação','Link','URL Final','Termo de Busca','Coletado em']
-    # Garante cabeçalho
-    values_now = ws_data.get_all_values()
-    if not values_now:
-        ws_data.update('A1:G1', [header])
-
-    # Ordena e normaliza colunas
-    for col in header:
+    # normaliza/ordena colunas
+    for col in HEADERS_DATA:
         if col not in df_novos.columns:
             df_novos[col] = ''
-    df_novos = df_novos[header].fillna('')
+    df_novos = df_novos[HEADERS_DATA].fillna('')
 
     ws_data.append_rows(df_novos.values.tolist(), value_input_option='RAW')
     print(f"✅ Linhas adicionadas na aba '{WORKSHEET_DATA}': {len(df_novos)}")
@@ -211,6 +229,7 @@ def filter_recent_24h(df_noticias):
     now_utc = datetime.now(timezone.utc)
     def _in_24h(val):
         if pd.isna(val):
+            # se não tem timestamp, mantemos (Google News às vezes falha)
             return True
         return (now_utc - val) <= timedelta(hours=24)
 
@@ -228,13 +247,12 @@ def make_fingerprint(row) -> str:
 def main():
     print("🚀 Iniciando scraper de notícias...")
     driver = setup_driver()
-    search_terms = ['PNE', 'Plano Nacional de Educação', 'Saúde Mental']
 
     resultados_por_termo = []
     resumo_coletas = []
 
     try:
-        for termo in tqdm(search_terms, desc="🔎 Buscando termos"):
+        for termo in tqdm(SEARCH_TERMS, desc="🔎 Buscando termos"):
             noticias = scrape_news_for_term(driver, termo)
             df_noticias = pd.DataFrame(noticias)
             df_noticias_24h = filter_recent_24h(df_noticias)
@@ -254,13 +272,19 @@ def main():
         if not df_geral.empty:
             df_geral['Coletado em'] = coletado_em_str
 
-        # Gera e usa fingerprints para deduplicar contra o histórico remoto (_fingerprints)
+        # Dedup remota via fingerprints
         new_fps = []
         df_para_append = pd.DataFrame()
+        try:
+            gc = _gspread_client_from_env()
+            _ = gc.open_by_key(SPREADSHEET_KEY)  # sanity check / permissão
+        except Exception as e:
+            print(f"❌ Erro com credenciais/planilha: {e}")
+            sys.exit(1)
+
         if not df_geral.empty:
             df_geral['__fp'] = df_geral.apply(make_fingerprint, axis=1)
             try:
-                gc = _gspread_client_from_env()
                 existing = load_fingerprints(gc)
                 mask_novos = ~df_geral['__fp'].isin(existing)
                 df_para_append = df_geral[mask_novos].copy()
@@ -275,14 +299,12 @@ def main():
         # APPEND no Google Sheets
         sheets_ok = False
         try:
-            gc2 = gc if 'gc' in locals() and gc is not None else _gspread_client_from_env()
             if not df_para_append.empty:
-                append_news_rows(gc2, df_para_append)
+                append_news_rows(gc, df_para_append)
             else:
                 print("ℹ️ Nenhuma notícia nova após deduplicação por fingerprints.")
-            # registra os novos fps (append)
             if new_fps:
-                append_fingerprints(gc2, new_fps)
+                append_fingerprints(gc, new_fps)
             sheets_ok = True
         except Exception as e:
             print(f"❌ Erro ao fazer append no Google Sheets: {e}")
