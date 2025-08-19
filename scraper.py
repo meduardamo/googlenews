@@ -2,7 +2,6 @@
 import os
 import json
 import time
-import shutil
 import hashlib
 from zoneinfo import ZoneInfo
 import pandas as pd
@@ -14,7 +13,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from tqdm import tqdm
 import gspread
-from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 import sys
 
@@ -33,7 +31,6 @@ def fmt_brasilia(dt: datetime) -> str:
 # Selenium / Driver
 # =========================
 def setup_driver():
-    """Configura e retorna uma instância do WebDriver usando Selenium Manager (sem webdriver_manager)."""
     print("🔧 Configurando WebDriver (Selenium Manager)...")
     options = Options()
     options.add_argument("--headless=new")
@@ -46,14 +43,10 @@ def setup_driver():
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-images")
     options.add_argument("--disable-javascript")
-
-    # Em Actions, essas flags evitam throttling quando headless
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
-
-    # Se o setup-chrome já pôs o Chrome no PATH, o Selenium Manager resolve o driver certo sozinho
     try:
         driver = webdriver.Chrome(options=options)
         print("✅ WebDriver configurado com sucesso (Selenium Manager)")
@@ -63,10 +56,9 @@ def setup_driver():
         sys.exit(1)
 
 # =========================
-# Fingerprints no Google Sheets
+# Google Sheets
 # =========================
 def _gspread_client_from_env():
-    """Lê credenciais do env (aceita GCP_SERVICE_ACCOUNT_JSON ou GOOGLE_APPLICATION_CREDENTIALS_JSON)"""
     raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if not raw:
         raise RuntimeError("Secret GCP_SERVICE_ACCOUNT_JSON ou GOOGLE_APPLICATION_CREDENTIALS_JSON não encontrado.")
@@ -82,7 +74,7 @@ def _gspread_client_from_env():
 
 SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
 WORKSHEET_DATA = 'google notícias'
-WORKSHEET_FP = '_fingerprints'  # aba "oculta" lógica (não precisa aparecer para o usuário)
+WORKSHEET_FP = '_fingerprints'  # armazena fp e timestamp
 
 def _ensure_worksheets(spreadsheet):
     try:
@@ -97,7 +89,6 @@ def _ensure_worksheets(spreadsheet):
     return ws_data, ws_fp
 
 def load_fingerprints(gc) -> set:
-    """Lê os fingerprints existentes da aba _fingerprints e retorna um set."""
     print("🧩 Carregando fingerprints do Google Sheets...")
     spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
     _, ws_fp = _ensure_worksheets(spreadsheet)
@@ -116,6 +107,29 @@ def append_fingerprints(gc, new_fps: list[str]):
     ws_fp.append_rows(rows, value_input_option='RAW')
     print(f"🧩 Fingerprints adicionados: {len(new_fps)}")
 
+def append_news_rows(gc, df_novos: pd.DataFrame):
+    """Append na aba 'google notícias' (com cabeçalho se necessário)."""
+    if df_novos.empty:
+        print("ℹ️ Nada novo para adicionar na aba de dados.")
+        return
+    spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
+    ws_data, _ = _ensure_worksheets(spreadsheet)
+
+    header = ['Título','Fonte','Data de Publicação','Link','URL Final','Termo de Busca','Coletado em']
+    # Garante cabeçalho
+    values_now = ws_data.get_all_values()
+    if not values_now:
+        ws_data.update('A1:G1', [header])
+
+    # Ordena e normaliza colunas
+    for col in header:
+        if col not in df_novos.columns:
+            df_novos[col] = ''
+    df_novos = df_novos[header].fillna('')
+
+    ws_data.append_rows(df_novos.values.tolist(), value_input_option='RAW')
+    print(f"✅ Linhas adicionadas na aba '{WORKSHEET_DATA}': {len(df_novos)}")
+
 # =========================
 # Resolvedor de URL final
 # =========================
@@ -125,26 +139,22 @@ SESSION.headers.update({
 })
 
 def resolve_final_url(url: str) -> str:
-    """Segue redirecionamentos e retorna a URL final do site original."""
     try:
         resp = SESSION.get(url, allow_redirects=True, timeout=12)
         return resp.url
     except Exception:
-        return url  # fallback
+        return url
 
 # =========================
 # Scraper
 # =========================
 def scrape_news_for_term(driver, termo):
-    """Faz scraping das notícias para um termo específico"""
     print(f"\n🔍 Buscando notícias para: {termo}")
     query_text = termo.replace(' ', '+')
     link = f"https://news.google.com/search?q={query_text}&hl=pt-BR&gl=BR&ceid=BR%3Apt-419"
     try:
         driver.get(link)
         time.sleep(3)
-
-        # scroll para carregar
         print("📜 Fazendo scroll da página...")
         for _ in range(10):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -193,7 +203,6 @@ def scrape_news_for_term(driver, termo):
         return []
 
 def filter_recent_24h(df_noticias):
-    """Mantém apenas notícias cujo timestamp do Google News está nas últimas 24h."""
     if df_noticias.empty:
         return pd.DataFrame()
     if 'Publicado_UTC' not in df_noticias.columns:
@@ -214,40 +223,7 @@ def make_fingerprint(row) -> str:
     return hashlib.sha256(base.encode('utf-8')).hexdigest()
 
 # =========================
-# Persistência local (Excel) e Sheets
-# =========================
-def save_to_excel(df_geral_final, resumo_coletas, filename='noticias_PNE_Planos_Educacao.xlsx'):
-    try:
-        with pd.ExcelWriter(filename) as writer:
-            (df_geral_final if not df_geral_final.empty else pd.DataFrame(
-                columns=['Título','Fonte','Data de Publicação','Link','URL Final','Termo de Busca','Coletado em'])) \
-                .to_excel(writer, sheet_name='Noticias', index=False)
-            pd.DataFrame(resumo_coletas).to_excel(writer, sheet_name='Resumo', index=False)
-        print(f"✅ Arquivo Excel '{filename}' salvo com sucesso")
-        return True
-    except Exception as e:
-        print(f"❌ Erro ao salvar Excel: {e}")
-        return False
-
-def upload_to_google_sheets(df_geral_final):
-    try:
-        print("📤 Enviando dados para Google Sheets...")
-        gc = _gspread_client_from_env()
-        spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
-        ws_data, _ = _ensure_worksheets(spreadsheet)
-        set_with_dataframe(
-            ws_data,
-            df_geral_final if not df_geral_final.empty else pd.DataFrame(
-                columns=['Título','Fonte','Data de Publicação','Link','URL Final','Termo de Busca','Coletado em'])
-        )
-        print("✅ Dados enviados para Google Sheets com sucesso")
-        return True, gc
-    except Exception as e:
-        print(f"❌ Erro ao enviar para Google Sheets: {e}")
-        return False, None
-
-# =========================
-# Main
+# Main (somente Google Sheets em append)
 # =========================
 def main():
     print("🚀 Iniciando scraper de notícias...")
@@ -267,6 +243,7 @@ def main():
 
         df_geral = pd.concat(resultados_por_termo, ignore_index=True) if resultados_por_termo else pd.DataFrame()
 
+        # Dedup local por URL Final (ou Link)
         if not df_geral.empty:
             if 'URL Final' in df_geral.columns:
                 df_geral = df_geral.drop_duplicates(subset=['URL Final']).copy()
@@ -277,44 +254,49 @@ def main():
         if not df_geral.empty:
             df_geral['Coletado em'] = coletado_em_str
 
-        if 'Publicado_UTC' in df_geral.columns:
-            df_geral_final = df_geral.drop(columns=['Publicado_UTC'])
-        else:
-            df_geral_final = df_geral
-
+        # Gera e usa fingerprints para deduplicar contra o histórico remoto (_fingerprints)
         new_fps = []
-        if not df_geral_final.empty:
-            df_geral_final['__fp'] = df_geral_final.apply(make_fingerprint, axis=1)
+        df_para_append = pd.DataFrame()
+        if not df_geral.empty:
+            df_geral['__fp'] = df_geral.apply(make_fingerprint, axis=1)
             try:
                 gc = _gspread_client_from_env()
                 existing = load_fingerprints(gc)
-                mask_novos = ~df_geral_final['__fp'].isin(existing)
-                df_geral_final = df_geral_final[mask_novos].copy()
-                new_fps = df_geral_final['__fp'].tolist()
+                mask_novos = ~df_geral['__fp'].isin(existing)
+                df_para_append = df_geral[mask_novos].copy()
+                new_fps = df_para_append['__fp'].tolist()
             except Exception as e:
-                print(f"⚠️ Não foi possível usar fingerprints remotos (seguindo sem): {e}")
+                print(f"⚠️ Não foi possível usar fingerprints remotos (seguindo sem dedup remota): {e}")
+                df_para_append = df_geral.copy()
 
-            if '__fp' in df_geral_final.columns:
-                df_geral_final.drop(columns=['__fp'], inplace=True)
+            if '__fp' in df_para_append.columns:
+                df_para_append.drop(columns=['__fp'], inplace=True)
 
-        excel_saved = save_to_excel(df_geral_final, resumo_coletas)
-        sheets_uploaded, gc_for_fp = upload_to_google_sheets(df_geral_final)
+        # APPEND no Google Sheets
+        sheets_ok = False
+        try:
+            gc2 = gc if 'gc' in locals() and gc is not None else _gspread_client_from_env()
+            if not df_para_append.empty:
+                append_news_rows(gc2, df_para_append)
+            else:
+                print("ℹ️ Nenhuma notícia nova após deduplicação por fingerprints.")
+            # registra os novos fps (append)
+            if new_fps:
+                append_fingerprints(gc2, new_fps)
+            sheets_ok = True
+        except Exception as e:
+            print(f"❌ Erro ao fazer append no Google Sheets: {e}")
+            sheets_ok = False
 
-        if sheets_uploaded and new_fps:
-            try:
-                append_fingerprints(gc_for_fp or _gspread_client_from_env(), new_fps)
-            except Exception as e:
-                print(f"⚠️ Falha ao registrar fingerprints: {e}")
-
-        total_noticias = len(df_geral_final) if not df_geral_final.empty else 0
+        total_noticias = len(df_para_append) if not df_para_append.empty else 0
         print(f"\n📊 RESUMO DA EXECUÇÃO:")
         print(f"📰 Total de notícias novas (24h, sem repetição): {total_noticias}")
         print(f"🕒 Coletado em (BRT): {coletado_em_str}")
-        print(f"📁 Excel salvo: {'✅' if excel_saved else '❌'}")
-        print(f"📤 Google Sheets atualizado: {'✅' if sheets_uploaded else '❌'}")
+        print(f"📤 Google Sheets (append): {'✅' if sheets_ok else '❌'}")
         if total_noticias == 0:
             print("⚠️ Nenhuma notícia nova encontrada nas últimas 24h (após deduplicação).")
             sys.exit(0)
+
     except Exception as e:
         print(f"❌ Erro geral na execução: {e}")
         sys.exit(1)
