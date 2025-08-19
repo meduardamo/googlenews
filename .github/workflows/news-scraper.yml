@@ -2,7 +2,8 @@ name: Scraper Google Notícias
 
 on:
   schedule:
-    - cron: '0 8 * * *'  # 08:00 UTC (ajuste aqui se quiser outro horário)
+    # executa a cada 6 horas
+    - cron: '0 */6 * * *'
   workflow_dispatch:
   push:
     branches: [ main ]
@@ -14,7 +15,7 @@ jobs:
   scrape-news:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout do código
+      - name: 📥 Checkout
         uses: actions/checkout@v4
 
       - name: 🐍 Setup Python
@@ -23,39 +24,25 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 📦 Instalar dependências
+      - name: 📦 Dependências
         run: |
           pip install --upgrade pip
-          pip install pandas selenium beautifulsoup4 tqdm gspread gspread-dataframe google-auth webdriver-manager openpyxl
+          pip install pandas selenium beautifulsoup4 gspread gspread-dataframe google-auth webdriver-manager requests
 
-      - name: 🌐 Setup Chrome
+      - name: 🌐 Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: 🔧 Configurar display virtual (para Selenium)
+      - name: 🖥️ Xvfb
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 &
 
-      - name: 🚀 Executar scraper
+      - name: 🚀 Rodar scraper
         env:
-          # Aceita qualquer um dos dois nomes de secret:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+          SPREADSHEET_KEY: ${{ secrets.SPREADSHEET_KEY }}
         run: |
           python scraper.py
-
-      - name: 📤 Upload dos arquivos gerados
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: noticias-excel-${{ github.run_number }}
-          path: '*.xlsx'
-          retention-days: 30
-
-      - name: 📊 Relatório de execução
-        if: always()
-        run: |
-          echo "🎯 Scraping executado em: $(date -u) UTC"
-          ls -la *.xlsx 2>/dev/null || echo "Nenhum arquivo Excel encontrado"
