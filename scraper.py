@@ -18,7 +18,7 @@ import hashlib
 import sys
 
 def setup_driver():
-    """Configura e retorna uma instância do WebDriver otimizada"""
+    """Configura e retorna uma instância do WebDriver"""
     print("🔧 Configurando WebDriver...")
     options = Options()
     options.add_argument("--headless=new")
@@ -31,7 +31,6 @@ def setup_driver():
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-images")
     options.add_argument("--disable-javascript")
-    options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
