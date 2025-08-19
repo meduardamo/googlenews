@@ -2,7 +2,7 @@ name: Scraper Google Notícias
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # a cada 6 horas
+    - cron: '0 */6 * * *'   # a cada 6 horas, no minuto 0
   workflow_dispatch:
   push:
     branches: [ main ]
@@ -14,7 +14,7 @@ jobs:
   scrape-news:
     runs-on: ubuntu-latest
     steps:
-      - name: 📥 Checkout
+      - name: 📥 Checkout do código
         uses: actions/checkout@v4
 
       - name: 🐍 Setup Python
@@ -23,25 +23,38 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 📦 Dependências
+      - name: 📦 Instalar dependências
         run: |
           pip install --upgrade pip
-          pip install pandas selenium beautifulsoup4 gspread gspread-dataframe google-auth webdriver-manager requests
+          pip install pandas selenium beautifulsoup4 tqdm gspread gspread-dataframe google-auth webdriver-manager openpyxl requests
 
-      - name: 🌐 Chrome
+      - name: 🌐 Setup Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
 
-      - name: 🖥️ Xvfb
+      - name: 🔧 Configurar display virtual (para Selenium)
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 &
 
-      - name: 🚀 Rodar scraper
+      - name: 🚀 Executar scraper
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
-          SPREADSHEET_KEY: ${{ secrets.planilha }}   # usa o secret chamado planilha
         run: |
           python scraper.py
+
+      - name: 📤 Upload dos arquivos gerados
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: noticias-excel-${{ github.run_number }}
+          path: '*.xlsx'
+          retention-days: 30
+
+      - name: 📊 Relatório de execução
+        if: always()
+        run: |
+          echo "🎯 Scraping executado em: $(date -u) UTC"
+          ls -la *.xlsx 2>/dev/null || echo "Nenhum arquivo Excel encontrado"
