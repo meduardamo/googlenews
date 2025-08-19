@@ -23,9 +23,13 @@ from google.oauth2.service_account import Credentials
 # =========================
 # CONFIG
 # =========================
-SPREADSHEET_KEY = os.getenv("SPREADSHEET_KEY", "1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY")
+SPREADSHEET_KEY = (
+    os.getenv("SPREADSHEET_KEY")
+    or os.getenv("PLANILHA")  # <- aceita secret chamado planilha
+)
+
 TAB_NOTICIAS = "google notícias"  # única aba
-TAB_CONFIG = "Config"             # opcional (coluna Termo, e Ativo TRUE/FALSE)
+TAB_CONFIG = "Config"             # opcional (coluna Termo, Ativo TRUE/FALSE)
 
 HTTP_TIMEOUT = 12
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119 Safari/537.36"
@@ -53,6 +57,8 @@ def _gspread_client_from_env():
     return gspread.authorize(creds)
 
 def open_sheet():
+    if not SPREADSHEET_KEY:
+        raise RuntimeError("Defina o secret SPREADSHEET_KEY ou PLANILHA com o ID da planilha.")
     gc = _gspread_client_from_env()
     return gc.open_by_key(SPREADSHEET_KEY)
 
@@ -60,7 +66,6 @@ def open_sheet():
 # SELENIUM
 # =========================
 def setup_driver():
-    print("🔧 Configurando WebDriver...")
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
@@ -70,25 +75,17 @@ def setup_driver():
     options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    # ⚠️ não desabilitar JS (Google News precisa de JS)
-
-    if os.getenv('GITHUB_ACTIONS'):
-        options.add_argument("--disable-background-timer-throttling")
-        options.add_argument("--disable-renderer-backgrounding")
-        options.add_argument("--disable-backgrounding-occluded-windows")
 
     chrome_path = shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("chromium")
     if chrome_path:
         options.binary_location = chrome_path
-        print(f"✅ Chrome: {chrome_path}")
 
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
-    print("✅ WebDriver OK")
     return driver
 
 # =========================
-# URL helpers (limpar UTM / seguir redirect)
+# URL helpers
 # =========================
 UTM_PARAMS = {"utm_source","utm_medium","utm_campaign","utm_term","utm_content",
               "utm_id","utm_name","gclid","fbclid","mcid","ocid","igshid"}
@@ -104,10 +101,6 @@ def strip_tracking_params(url: str) -> str:
         return url
 
 def resolve_final_url(url: str) -> str:
-    """
-    Segue o redirect do Google News (/articles/...) até o publisher.
-    Retorna a URL final limpa (sem UTMs).
-    """
     try:
         r = requests.get(url, timeout=HTTP_TIMEOUT, allow_redirects=True, headers={"User-Agent": USER_AGENT})
         final = r.url
@@ -116,7 +109,6 @@ def resolve_final_url(url: str) -> str:
         return strip_tracking_params(url)
 
 def url_fingerprint(url: str) -> str:
-    """domínio + path, sem query/fragment (para dedup estável)"""
     try:
         p = urlparse(url)
         base = urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
@@ -128,13 +120,11 @@ def url_fingerprint(url: str) -> str:
 # SCRAPER
 # =========================
 def scrape_news_for_term(driver, termo):
-    print(f"\n🔍 Termo: {termo}")
     q = termo.replace(" ", "+")
     link = f"https://news.google.com/search?q={q}&hl=pt-BR&gl=BR&ceid=BR%3Apt-419"
     driver.get(link)
     time.sleep(3)
 
-    # scroll para carregar itens
     last_h = driver.execute_script("return document.body.scrollHeight")
     for _ in range(12):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -151,20 +141,16 @@ def scrape_news_for_term(driver, termo):
     rows = []
     for it in items:
         try:
-            # título
             h = it.find(["h3", "h4"])
             title = h.get_text(strip=True) if h else None
-            # link relativo
             a = it.find("a", href=True)
             href = a["href"] if a else None
             if href and href.startswith("./"):
                 href = base + href[1:]
             elif href and href.startswith("/"):
                 href = base + href
-            # publisher
             pub = it.find("div", class_="vr1PYe") or it.find("div", class_="wsLqz")
             fonte = pub.get_text(strip=True) if pub else ""
-            # data
             t = it.find("time")
             dt_pub = ""
             if t and t.get("datetime"):
@@ -203,7 +189,7 @@ def filter_last_24h(df: pd.DataFrame) -> pd.DataFrame:
     return df[mask].copy()
 
 # =========================
-# SHEETS: leitura de termos e UPSERT na mesma aba
+# SHEETS: termos + upsert
 # =========================
 def read_terms_from_config(sh):
     try:
@@ -215,11 +201,9 @@ def read_terms_from_config(sh):
             dfc = dfc[dfc["Ativo"].astype(str).str.lower().isin(["true","1","sim","yes","y"])]
         termos = [t for t in dfc["Termo"].astype(str).str.strip().tolist() if t]
         if termos:
-            print(f"🧩 Termos (Config): {termos}")
             return termos
     except Exception:
         pass
-    print("➡️ Usando termos padrão: ['PNE','Plano Nacional de Educação','Saúde Mental']")
     return ['PNE', 'Plano Nacional de Educação', 'Saúde Mental']
 
 def ensure_sheet(sh):
@@ -232,9 +216,7 @@ def prepare_new_rows(df_day: pd.DataFrame, coletado_em_str: str) -> pd.DataFrame
     if df_day.empty:
         return df_day
     df = df_day.copy()
-    # Dominio
     df["Dominio"] = df["URL Final"].apply(lambda u: urlparse(str(u)).netloc if pd.notna(u) else "")
-    # métricas iniciais
     df["Primeiro Visto"] = coletado_em_str
     df["Último Visto"] = coletado_em_str
     df["Vezes Visto"] = 1
@@ -250,10 +232,8 @@ def upsert_google_noticias(sh, df_day: pd.DataFrame, coletado_em_str: str):
 
     if existing.empty:
         set_with_dataframe(ws, new_rows.sort_values("Último Visto", ascending=False))
-        print(f"🧾 Inseridos {len(new_rows)} itens (primeira carga).")
         return
 
-    # colunas “manuais” preservadas pela equipe (tudo que já existe e não é CORE)
     manual_cols = [c for c in existing.columns if c not in CORE_COLS]
 
     existing["Fingerprint"] = existing["Fingerprint"].astype(str)
@@ -263,18 +243,12 @@ def upsert_google_noticias(sh, df_day: pd.DataFrame, coletado_em_str: str):
     novos = new_rows[~new_rows["Fingerprint"].isin(seen)].copy()
     repetidos = new_rows[new_rows["Fingerprint"].isin(seen)].copy()
 
-    # atualiza métricas dos repetidos
     if not repetidos.empty:
         rep_map = repetidos.set_index("Fingerprint")
         idx = existing["Fingerprint"].isin(rep_map.index)
         existing.loc[idx, "Último Visto"] = coletado_em_str
         existing.loc[idx, "Vezes Visto"] = pd.to_numeric(existing.loc[idx, "Vezes Visto"], errors="coerce").fillna(0).astype(int) + 1
-        # opcional: atualizar campos vazios com info mais nova
-        for col in ["URL Final","URL GoogleNews","Título","Fonte","Termo","Data de Publicação","Dominio"]:
-            existing.loc[idx, col] = existing.loc[idx, col].where(existing.loc[idx, col].astype(str).str.len() > 0,
-                                                                  rep_map.loc[existing.loc[idx, "Fingerprint"], col].values)
 
-    # completar colunas manuais nos novos (vazias)
     for c in manual_cols:
         if c not in novos.columns:
             novos[c] = ""
@@ -286,23 +260,18 @@ def upsert_google_noticias(sh, df_day: pd.DataFrame, coletado_em_str: str):
     existing = existing[ordered_cols]
 
     updated = pd.concat([existing, novos[ordered_cols]], ignore_index=True)
-
-    # ordena por Último Visto desc
     if "Último Visto" in updated.columns:
         parsed = pd.to_datetime(updated["Último Visto"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
         updated = updated.assign(_ord=parsed).sort_values("_ord", ascending=False).drop(columns=["_ord"])
 
     set_with_dataframe(ws, updated)
-    print(f"✅ Upsert | novos: {len(novos)} | atualizados: {len(repetidos)} | total: {len(updated)}")
 
 # =========================
 # MAIN
 # =========================
 def main():
-    print("🚀 Iniciando scraper Google News")
     sh = open_sheet()
     termos = read_terms_from_config(sh)
-
     coletado_em_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
 
     driver = setup_driver()
@@ -315,20 +284,17 @@ def main():
 
         df_all = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         if df_all.empty:
-            print("⚠️ Nenhuma notícia encontrada (últimas 24h). Ainda assim mantendo histórico existente.")
+            print("⚠️ Nenhuma notícia encontrada nas últimas 24h.")
             return
 
-        # dedup por Fingerprint (mesmo artigo, múltiplos cards/termos)
         df_all["URL Final"] = df_all["URL Final"].fillna(df_all["URL GoogleNews"])
         df_all["Fingerprint"] = df_all["Fingerprint"].fillna(df_all["URL Final"]).astype(str)
         df_all = df_all[df_all["Fingerprint"].str.len() > 0]
         df_all = df_all.drop_duplicates(subset=["Fingerprint","Termo","Fonte","Título"])
 
         upsert_google_noticias(sh, df_all, coletado_em_str)
-        print(f"📌 Coletados (24h, únicos por artigo/termo/fonte): {len(df_all)}")
     finally:
         driver.quit()
-        print("🏁 Finalizado")
 
 if __name__ == "__main__":
     try:
