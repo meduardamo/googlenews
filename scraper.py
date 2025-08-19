@@ -9,19 +9,22 @@ import pandas as pd
 import requests
 
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import TimeoutException
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from tqdm import tqdm
 import gspread
 from gspread_dataframe import set_with_dataframe
-from google.oauth2.service_account import Credentials  # <— moderno
+from google.oauth2.service_account import Credentials
 import sys
 
 # =========================
-# Utilidades de horário
+# Fuso
 # =========================
 TZ_BR = ZoneInfo("America/Sao_Paulo")
 
@@ -34,32 +37,31 @@ def fmt_brasilia(dt: datetime) -> str:
 # =========================
 # Selenium / Driver
 # =========================
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-# ↓ não precisa mais do Service / webdriver_manager
-
 def setup_driver():
-    """Configura e retorna uma instância do WebDriver usando Selenium Manager (sem webdriver_manager)."""
+    """Configura e retorna uma instância do WebDriver usando Selenium Manager."""
     print("🔧 Configurando WebDriver (Selenium Manager)...")
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920x1080")
     options.add_argument("--blink-settings=imagesEnabled=false")
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
-    options.add_argument("--disable-images")
-    options.add_argument("--disable-javascript")
+    options.page_load_strategy = "eager"  # carrega mais rápido
 
-    # Em Actions, essas flags evitam throttling quando headless
+    # NÃO desabilitar JS: necessário para redirecionamentos do Google News
+
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
 
-    # Se o setup-chrome já pôs o Chrome no PATH, o Selenium Manager resolve o driver certo sozinho
+    chrome_path = shutil.which("google-chrome") or shutil.which("chrome") or shutil.which("chromium")
+    if chrome_path:
+        options.binary_location = chrome_path
+        print(f"✅ Chrome encontrado em: {chrome_path}")
+
     try:
         driver = webdriver.Chrome(options=options)
         print("✅ WebDriver configurado com sucesso (Selenium Manager)")
@@ -69,10 +71,13 @@ def setup_driver():
         sys.exit(1)
 
 # =========================
-# Fingerprints no Google Sheets
+# Google Sheets / Fingerprints
 # =========================
+SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
+WORKSHEET_DATA = 'google notícias'
+WORKSHEET_FP = '_fingerprints'
+
 def _gspread_client_from_env():
-    """Lê credenciais do env (aceita GCP_SERVICE_ACCOUNT_JSON ou GOOGLE_APPLICATION_CREDENTIALS_JSON)"""
     raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON") or os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
     if not raw:
         raise RuntimeError("Secret GCP_SERVICE_ACCOUNT_JSON ou GOOGLE_APPLICATION_CREDENTIALS_JSON não encontrado.")
@@ -85,10 +90,6 @@ def _gspread_client_from_env():
         "https://www.googleapis.com/auth/drive",
     ])
     return gspread.authorize(creds)
-
-SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
-WORKSHEET_DATA = 'google notícias'
-WORKSHEET_FP = '_fingerprints'  # aba "oculta" lógica (não precisa aparecer para o usuário)
 
 def _ensure_worksheets(spreadsheet):
     try:
@@ -103,7 +104,6 @@ def _ensure_worksheets(spreadsheet):
     return ws_data, ws_fp
 
 def load_fingerprints(gc) -> set:
-    """Lê os fingerprints existentes da aba _fingerprints e retorna um set."""
     print("🧩 Carregando fingerprints do Google Sheets...")
     spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
     _, ws_fp = _ensure_worksheets(spreadsheet)
@@ -123,36 +123,52 @@ def append_fingerprints(gc, new_fps: list[str]):
     print(f"🧩 Fingerprints adicionados: {len(new_fps)}")
 
 # =========================
-# Resolvedor de URL final
+# Resolver URL Final (em nova aba)
 # =========================
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0 Safari/537.36"
-})
-
-def resolve_final_url(driver, url: str) -> str:
-    """Abre o link do Google News no navegador e pega a URL final redirecionada."""
+def resolve_final_url(driver, url: str, wait_seconds: int = 8) -> str:
+    """
+    Abre o link do Google News em uma nova aba e captura a URL final.
+    Mantém a aba original com os resultados.
+    """
+    original_window = driver.current_window_handle
     try:
-        driver.get(url)
-        time.sleep(2)  # dá tempo pro redirect acontecer
-        return driver.current_url
+        driver.execute_script("window.open(arguments[0], '_blank');", url)
+        WebDriverWait(driver, 10).until(EC.number_of_windows_to_be(2))
+        new_window = [h for h in driver.window_handles if h != original_window][0]
+        driver.switch_to.window(new_window)
+
+        # aguarda redirecionar/renderizar
+        try:
+            WebDriverWait(driver, wait_seconds).until(lambda d: "news.google.com" not in d.current_url)
+        except TimeoutException:
+            pass  # pega o que tiver
+
+        final_url = driver.current_url
+        driver.close()
+        driver.switch_to.window(original_window)
+        return final_url
     except Exception:
+        # tentativa de segurança
+        try:
+            if len(driver.window_handles) > 1:
+                driver.close()
+                driver.switch_to.window(original_window)
+        except Exception:
+            pass
         return url
 
 # =========================
 # Scraper
 # =========================
 def scrape_news_for_term(driver, termo):
-    """Faz scraping das notícias para um termo específico"""
     print(f"\n🔍 Buscando notícias para: {termo}")
     query_text = termo.replace(' ', '+')
     link = f"https://news.google.com/search?q={query_text}&hl=pt-BR&gl=BR&ceid=BR%3Apt-419"
     try:
         driver.get(link)
-        time.sleep(3)
+        time.sleep(2)
 
-        # scroll para carregar
-        print("📜 Fazendo scroll da página...")
+        # scroll para carregar mais cards
         for _ in range(10):
             driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
             time.sleep(1)
@@ -164,12 +180,11 @@ def scrape_news_for_term(driver, termo):
         root = 'https://news.google.com'
         for item in news_items:
             try:
-                title = item.find('a', class_='JtKRv') or item.find('h3') or item.find('h4')
+                title_el = item.find('a', class_='JtKRv') or item.find('h3') or item.find('h4')
                 link_item = item.find("a", href=True)
                 publisher = item.find('div', class_='vr1PYe') or item.find('div', class_='wsLqz')
                 time_tag = item.find('time', class_='hvbAAd') or item.find('time')
 
-                # datetime ISO em UTC se disponível (ex.: 2025-08-19T12:34:56Z)
                 dt_utc = None
                 if time_tag and time_tag.get('datetime'):
                     try:
@@ -177,95 +192,21 @@ def scrape_news_for_term(driver, termo):
                     except Exception:
                         dt_utc = None
 
-                # link bruto do Google News
-                link_bruto = root + link_item['href'][1:] if link_item and link_item.get('href') else None
+                link_bruto = None
+                if link_item and link_item.get('href'):
+                    href = link_item['href']
+                    # normalmente começa com ./read/ ou /read/
+                    if href.startswith('.'):
+                        href = href[1:]
+                    link_bruto = root + href if href.startswith('/') else href
+
                 if not link_bruto:
                     continue
 
-                # URL final resolvida
                 url_final = resolve_final_url(driver, link_bruto)
 
-                noticia = {
-                    'Título': title.text.strip() if title else 'Título não encontrado',
-                    'Fonte': publisher.text.strip() if publisher else 'Fonte não encontrada',
-                    # mantemos data de publicação como dd/mm/aaaa; usamos dt_utc para filtro 24h
-                    'Data de Publicação': dt_utc.astimezone(TZ_BR).strftime('%d/%m/%Y') if dt_utc else 'Data não encontrada',
-                    'Link': link_bruto,
-                    'URL Final': url_final,
-                    'Termo de Busca': termo
-                }
-                noticias.append(noticia)
-            except Exception as e:
-                print(f"⚠️ Erro ao processar notícia: {e}")
-                continue
-        return noticias
-    except Exception as e:
-        print(f"❌ Erro ao fazer scraping para '{termo}': {e}")
-        return []
-
-def filter_recent_24h(df_noticias):
-    """Mantém apenas notícias cujo timestamp do Google News está nas últimas 24h."""
-    if df_noticias.empty:
-        return pd.DataFrame()
-
-    # Tentar recuperar a coluna ISO original via 'Link'? Não vem. Então refazemos parse do 'Data de Publicação' não ajuda.
-    # Solução: durante o scrape acima, guardamos apenas a data formatada. Para o filtro 24h real, vamos re-scrapear as <time>?
-    # Melhor: salvar 'Publicado_UTC' internamente durante o scrape.
-    # Ajuste: se não existir, tudo passa (fallback seguro).
-
-    if 'Publicado_UTC' not in df_noticias.columns:
-        # compatibilidade: cria vazia
-        df_noticias['Publicado_UTC'] = pd.NaT
-
-    now_utc = datetime.now(timezone.utc)
-    def _in_24h(val):
-        if pd.isna(val):
-            return True  # se não temos o horário, não bloqueia (ou mude para False se preferir ser estrito)
-        return (now_utc - val) <= timedelta(hours=24)
-
-    mask = df_noticias['Publicado_UTC'].apply(_in_24h)
-    return df_noticias[mask].copy()
-
-# Pequena correção: vamos ajustar o scraper para também preencher 'Publicado_UTC'
-def scrape_news_for_term(driver, termo):
-    print(f"\n🔍 Buscando notícias para: {termo}")
-    query_text = termo.replace(' ', '+')
-    link = f"https://news.google.com/search?q={query_text}&hl=pt-BR&gl=BR&ceid=BR%3Apt-419"
-    try:
-        driver.get(link)
-        time.sleep(3)
-        print("📜 Fazendo scroll da página...")
-        for _ in range(10):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(1)
-
-        soup = BeautifulSoup(driver.page_source, 'html.parser')
-        news_items = soup.select('div.UW0SDc, article')
-
-        noticias = []
-        root = 'https://news.google.com'
-        for item in news_items:
-            try:
-                title = item.find('a', class_='JtKRv') or item.find('h3') or item.find('h4')
-                link_item = item.find("a", href=True)
-                publisher = item.find('div', class_='vr1PYe') or item.find('div', class_='wsLqz')
-                time_tag = item.find('time', class_='hvbAAd') or item.find('time')
-
-                dt_utc = None
-                if time_tag and time_tag.get('datetime'):
-                    try:
-                        dt_utc = datetime.strptime(time_tag['datetime'], '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc)
-                    except Exception:
-                        dt_utc = None
-
-                link_bruto = root + link_item['href'][1:] if link_item and link_item.get('href') else None
-                if not link_bruto:
-                    continue
-
-                url_final = resolve_final_url(link_bruto)
-
                 noticias.append({
-                    'Título': title.text.strip() if title else 'Título não encontrado',
+                    'Título': title_el.text.strip() if title_el else 'Título não encontrado',
                     'Fonte': publisher.text.strip() if publisher else 'Fonte não encontrada',
                     'Data de Publicação': dt_utc.astimezone(TZ_BR).strftime('%d/%m/%Y') if dt_utc else 'Data não encontrada',
                     'Link': link_bruto,
@@ -281,20 +222,27 @@ def scrape_news_for_term(driver, termo):
         print(f"❌ Erro ao fazer scraping para '{termo}': {e}")
         return []
 
+def filter_recent_24h(df_noticias):
+    """Mantém apenas notícias cujo 'Publicado_UTC' está nas últimas 24h; se não houver timestamp, descarta (estrito)."""
+    if df_noticias.empty:
+        return pd.DataFrame()
+
+    if 'Publicado_UTC' not in df_noticias.columns:
+        return pd.DataFrame()
+
+    now_utc = datetime.now(timezone.utc)
+    mask = df_noticias['Publicado_UTC'].apply(lambda v: (not pd.isna(v)) and (now_utc - v <= timedelta(hours=24)))
+    return df_noticias[mask].copy()
+
 def make_fingerprint(row) -> str:
-    """
-    Gera um fingerprint estável da notícia.
-    Usamos URL Final (ou Link) + Título, normalizados.
-    """
     base = (row.get('URL Final') or row.get('Link') or '') + '|' + (row.get('Título') or '')
     base = base.strip().lower()
     return hashlib.sha256(base.encode('utf-8')).hexdigest()
 
 # =========================
-# Persistência local (Excel) e Sheets
+# Persistência
 # =========================
 def save_to_excel(df_geral_final, resumo_coletas, filename='noticias_PNE_Planos_Educacao.xlsx'):
-    """Salva os dados em Excel"""
     try:
         with pd.ExcelWriter(filename) as writer:
             (df_geral_final if not df_geral_final.empty else pd.DataFrame(
@@ -308,7 +256,6 @@ def save_to_excel(df_geral_final, resumo_coletas, filename='noticias_PNE_Planos_
         return False
 
 def upload_to_google_sheets(df_geral_final):
-    """Upload para Google Sheets (google-auth)"""
     try:
         print("📤 Enviando dados para Google Sheets...")
         gc = _gspread_client_from_env()
@@ -329,7 +276,6 @@ def upload_to_google_sheets(df_geral_final):
 # Main
 # =========================
 def main():
-    """Função principal"""
     print("🚀 Iniciando scraper de notícias...")
     driver = setup_driver()
     search_terms = ['PNE', 'Plano Nacional de Educação', 'Saúde Mental']
@@ -347,25 +293,22 @@ def main():
 
         df_geral = pd.concat(resultados_por_termo, ignore_index=True) if resultados_por_termo else pd.DataFrame()
 
-        # dedupe intra-execução (preferindo URL Final)
+        # dedupe intra-execução
         if not df_geral.empty:
             if 'URL Final' in df_geral.columns:
                 df_geral = df_geral.drop_duplicates(subset=['URL Final']).copy()
             else:
                 df_geral = df_geral.drop_duplicates(subset=['Link']).copy()
 
-        # adiciona coluna "Coletado em" (Brasília)
+        # coluna "Coletado em" (BRT)
         coletado_em_str = fmt_brasilia(agora_brasilia())
         if not df_geral.empty:
             df_geral['Coletado em'] = coletado_em_str
 
-        # remove colunas internas
-        if 'Publicado_UTC' in df_geral.columns:
-            df_geral_final = df_geral.drop(columns=['Publicado_UTC'])
-        else:
-            df_geral_final = df_geral
+        # retirar coluna técnica
+        df_geral_final = df_geral.drop(columns=['Publicado_UTC']) if 'Publicado_UTC' in df_geral.columns else df_geral
 
-        # ====== Deduplicação entre execuções via fingerprints no Sheets ======
+        # dedupe entre execuções via fingerprints
         new_fps = []
         if not df_geral_final.empty:
             df_geral_final['__fp'] = df_geral_final.apply(make_fingerprint, axis=1)
@@ -377,32 +320,26 @@ def main():
                 new_fps = df_geral_final['__fp'].tolist()
             except Exception as e:
                 print(f"⚠️ Não foi possível usar fingerprints remotos (seguindo sem): {e}")
-
-            # limpa a coluna técnica
             if '__fp' in df_geral_final.columns:
                 df_geral_final.drop(columns=['__fp'], inplace=True)
 
-        # salvar Excel
         excel_saved = save_to_excel(df_geral_final, resumo_coletas)
-
-        # enviar para Sheets
         sheets_uploaded, gc_for_fp = upload_to_google_sheets(df_geral_final)
 
-        # se conseguimos enviar e temos novos fingerprints, anexa na aba _fingerprints
         if sheets_uploaded and new_fps:
             try:
                 append_fingerprints(gc_for_fp or _gspread_client_from_env(), new_fps)
             except Exception as e:
                 print(f"⚠️ Falha ao registrar fingerprints: {e}")
 
-        total_noticias = len(df_geral_final) if not df_geral_final.empty else 0
-        print(f"\n📊 RESUMO DA EXECUÇÃO:")
-        print(f"📰 Total de notícias novas (24h, sem repetição): {total_noticias}")
+        total_novas = len(df_geral_final) if not df_geral_final.empty else 0
+        print("\n📊 RESUMO DA EXECUÇÃO:")
+        print(f"📰 Novas (24h, sem repetição): {total_novas}")
         print(f"🕒 Coletado em (BRT): {coletado_em_str}")
         print(f"📁 Excel salvo: {'✅' if excel_saved else '❌'}")
         print(f"📤 Google Sheets atualizado: {'✅' if sheets_uploaded else '❌'}")
-        if total_noticias == 0:
-            print("⚠️ Nenhuma notícia nova encontrada nas últimas 24h (após deduplicação).")
+        if total_novas == 0:
+            print("⚠️ Nenhuma notícia nova encontrada (após filtros e dedup).")
             sys.exit(0)
     except Exception as e:
         print(f"❌ Erro geral na execução: {e}")
