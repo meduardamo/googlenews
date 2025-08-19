@@ -34,7 +34,6 @@ def fmt_brasilia(dt: datetime) -> str:
 # Selenium / Driver
 # =========================
 def setup_driver():
-    """Configura e retorna uma instância do WebDriver usando Selenium Manager (sem webdriver_manager)."""
     print("🔧 Configurando WebDriver (Selenium Manager)...")
     options = Options()
     options.add_argument("--headless=new")
@@ -46,22 +45,15 @@ def setup_driver():
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-plugins")
     options.add_argument("--disable-images")
-    # ⚠️ manter JS ligado ajuda em alguns redirecionamentos por meta refresh;
-    # se quiser MUITO performance, reative a linha abaixo, mas pode perder alguns redirects.
-    # options.add_argument("--disable-javascript")
+    options.add_argument("--disable-javascript")  # 🔴 agora JS está desativado
 
     if os.getenv('GITHUB_ACTIONS'):
         options.add_argument("--disable-background-timer-throttling")
         options.add_argument("--disable-renderer-backgrounding")
         options.add_argument("--disable-backgrounding-occluded-windows")
 
-    try:
-        driver = webdriver.Chrome(options=options)
-        print("✅ WebDriver configurado com sucesso (Selenium Manager)")
-        return driver
-    except Exception as e:
-        print(f"❌ Erro ao configurar WebDriver: {e}")
-        sys.exit(1)
+    driver = webdriver.Chrome(options=options)
+    return driver
 
 # =========================
 # Fingerprints no Google Sheets
