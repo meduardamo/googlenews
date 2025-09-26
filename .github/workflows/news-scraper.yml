@@ -1,5 +1,4 @@
 name: Scraper Google Notícias
-
 on:
   schedule:
     - cron: '0 */6 * * *'   # a cada 6 horas, no minuto 0
@@ -9,42 +8,42 @@ on:
     paths:
       - 'scraper.py'
       - '.github/workflows/news-scraper.yml'
-
 jobs:
   scrape-news:
     runs-on: ubuntu-latest
     steps:
       - name: 📥 Checkout do código
         uses: actions/checkout@v4
-
+      
       - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-
+      
       - name: 📦 Instalar dependências
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-
+      
       - name: 🌐 Setup Chrome
         uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-
+      
       - name: 🔧 Configurar display virtual (para Selenium)
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 &
-
+      
       - name: 🚀 Executar scraper
         env:
           GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SERVICE_ACCOUNT_JSON }}
           GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+          PLANILHA: ${{ secrets.PLANILHA }}
         run: |
           python scraper.py
-
+      
       - name: 📤 Upload dos arquivos gerados
         if: always()
         uses: actions/upload-artifact@v4
@@ -52,7 +51,7 @@ jobs:
           name: noticias-excel-${{ github.run_number }}
           path: '*.xlsx'
           retention-days: 30
-
+      
       - name: 📊 Relatório de execução
         if: always()
         run: |
