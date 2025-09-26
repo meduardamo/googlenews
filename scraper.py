@@ -21,7 +21,11 @@ import sys
 # =========================
 TZ_BR = ZoneInfo("America/Sao_Paulo")
 
-SPREADSHEET_KEY = '1G81BndSPpnViMDxRKQCth8PwK0xmAwH-w-T7FjgnwcY'
+# Agora a chave vem de uma variável de ambiente (secret)
+SPREADSHEET_KEY = os.environ.get('PLANILHA')
+if not SPREADSHEET_KEY:
+    raise RuntimeError("Secret PLANILHA não encontrado. Configure o secret no GitHub Actions.")
+
 WORKSHEET_DATA = 'google notícias'
 WORKSHEET_FP = '_fingerprints'  # armazena fp e timestamp
 
