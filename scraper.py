@@ -125,18 +125,19 @@ def load_fingerprints(gc) -> set:
     print(f"🧩 Fingerprints carregados: {len(fps)}")
     return fps
 
-def append_fingerprints(gc, new_fps: list[str]):
+def insert_fingerprints(gc, new_fps: list[str]):
     if not new_fps:
         return
     spreadsheet = gc.open_by_key(SPREADSHEET_KEY)
     _, ws_fp = _ensure_worksheets(spreadsheet)
     now_brt = fmt_brasilia(agora_brasilia())
     rows = [[fp, now_brt] for fp in new_fps]
-    ws_fp.append_rows(rows, value_input_option='RAW')
-    print(f"🧩 Fingerprints adicionados: {len(new_fps)}")
+    # Insere fingerprints logo após o cabeçalho
+    ws_fp.insert_rows(rows, row=2, value_input_option='RAW')
+    print(f"🧩 Fingerprints inseridos: {len(new_fps)}")
 
-def append_news_rows(gc, df_novos: pd.DataFrame):
-    """Append na aba 'google notícias' (com cabeçalho garantido)."""
+def insert_news_rows(gc, df_novos: pd.DataFrame):
+    """Insert na aba 'google notícias' logo após o cabeçalho."""
     if df_novos.empty:
         print("ℹ️ Nada novo para adicionar na aba de dados.")
         return
@@ -149,8 +150,9 @@ def append_news_rows(gc, df_novos: pd.DataFrame):
             df_novos[col] = ''
     df_novos = df_novos[HEADERS_DATA].fillna('')
 
-    ws_data.append_rows(df_novos.values.tolist(), value_input_option='RAW')
-    print(f"✅ Linhas adicionadas na aba '{WORKSHEET_DATA}': {len(df_novos)}")
+    # Insere linhas a partir da linha 2 (logo após o cabeçalho)
+    ws_data.insert_rows(df_novos.values.tolist(), row=2, value_input_option='RAW')
+    print(f"✅ Linhas inseridas no início da aba '{WORKSHEET_DATA}': {len(df_novos)}")
 
 # =========================
 # Resolvedor de URL final
