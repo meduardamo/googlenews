@@ -98,18 +98,18 @@ def _ensure_worksheets(spreadsheet):
         ws_data = spreadsheet.worksheet(WORKSHEET_DATA)
     except gspread.WorksheetNotFound:
         ws_data = spreadsheet.add_worksheet(title=WORKSHEET_DATA, rows="100", cols=str(len(HEADERS_DATA)))
-        ws_data.update(f'A1:{_col_letter(len(HEADERS_DATA))}1', [HEADERS_DATA])  # cabeçalho
+        ws_data.update(values=[HEADERS_DATA], range_name=f'A1:{_col_letter(len(HEADERS_DATA))}1')  # cabeçalho
     # garante cabeçalho mesmo se a aba já existia sem header correto
     first_row = ws_data.row_values(1)
     if [c.strip().lower() for c in first_row] != [c.lower() for c in HEADERS_DATA]:
-        ws_data.update(f'A1:{_col_letter(len(HEADERS_DATA))}1', [HEADERS_DATA])
+        ws_data.update(values=[HEADERS_DATA], range_name=f'A1:{_col_letter(len(HEADERS_DATA))}1')
 
     # FINGERPRINTS
     try:
         ws_fp = spreadsheet.worksheet(WORKSHEET_FP)
     except gspread.WorksheetNotFound:
         ws_fp = spreadsheet.add_worksheet(title=WORKSHEET_FP, rows="100", cols=str(len(HEADERS_FP)))
-        ws_fp.update(f'A1:{_col_letter(len(HEADERS_FP))}1', [HEADERS_FP])        # cabeçalho
+        ws_fp.update(values=[HEADERS_FP], range_name=f'A1:{_col_letter(len(HEADERS_FP))}1')        # cabeçalho
     first_row_fp = ws_fp.row_values(1)
     if [c.strip().lower() for c in first_row_fp] != [c.lower() for c in HEADERS_FP]:
         ws_fp.update(f'A1:{_col_letter(len(HEADERS_FP))}1', [HEADERS_FP])
@@ -302,25 +302,25 @@ def main():
             if '__fp' in df_para_append.columns:
                 df_para_append.drop(columns=['__fp'], inplace=True)
 
-        # APPEND no Google Sheets
+        # INSERT no Google Sheets
         sheets_ok = False
         try:
             if not df_para_append.empty:
-                append_news_rows(gc, df_para_append)
+                insert_news_rows(gc, df_para_append)
             else:
                 print("ℹ️ Nenhuma notícia nova após deduplicação por fingerprints.")
             if new_fps:
-                append_fingerprints(gc, new_fps)
+                insert_fingerprints(gc, new_fps)
             sheets_ok = True
         except Exception as e:
-            print(f"❌ Erro ao fazer append no Google Sheets: {e}")
+            print(f"❌ Erro ao fazer insert no Google Sheets: {e}")
             sheets_ok = False
 
         total_noticias = len(df_para_append) if not df_para_append.empty else 0
         print(f"\n📊 RESUMO DA EXECUÇÃO:")
         print(f"📰 Total de notícias novas (24h, sem repetição): {total_noticias}")
         print(f"🕒 Coletado em (BRT): {coletado_em_str}")
-        print(f"📤 Google Sheets (append): {'✅' if sheets_ok else '❌'}")
+        print(f"📤 Google Sheets (insert): {'✅' if sheets_ok else '❌'}")
         if total_noticias == 0:
             print("⚠️ Nenhuma notícia nova encontrada nas últimas 24h (após deduplicação).")
             sys.exit(0)
