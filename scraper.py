@@ -1,8 +1,4 @@
-# coletor_sheets.py
-# Coleta notícias e escreve direto no Google Sheets (uma aba por cliente)
-# Sem CSV e sem XLSX. Em cada aba, 'palavras_por_cliente' contém só as keywords do próprio cliente.
-
-import os, re, csv, time, sys
+import os, re, time, sys
 from datetime import datetime, timedelta, date
 
 import feedparser
@@ -13,7 +9,11 @@ import gspread
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 
-# Mapa Cliente → Tema → Keywords (whole-word)
+# limite de caracteres por célula do Sheets (50k). uso 48k para margem
+MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "48000"))
+SHEETS_SPLIT_TEXT = os.getenv("SHEETS_SPLIT_TEXT", "0").strip() in ("1", "true", "True", "yes", "on")
+
+# mapa Cliente → Tema → Keywords (whole-word)
 CLIENT_THEME_DATA = """
 IAS|Educação|Matemática; Alfabetização; Alfabetização Matemática; Recomposição de aprendizagem; Plano Nacional de Educação
 ISG|Educação|Tempo Integral; Ensino em tempo integral; Ensino Profissional e Tecnológico; Fundeb; PROPAG; Educação em tempo integral; Escola em tempo integral; Plano Nacional de Educação; Programa escola em tempo integral; Programa Pé-de-meia; PNEERQ; INEP; FNDE; Conselho Nacional de Educação; PDDE; Programa de Fomento às Escolas de Ensino Médio em Tempo Integral; Celular nas escolas; Juros da Educação
@@ -53,6 +53,24 @@ def parse_palavras_por_cliente_cell(cell: str):
             out[k.strip()] = [x.strip() for x in v.split('|') if x.strip()]
     return out
 
+def _clean_text(s):
+    if s is None:
+        return ""
+    s = str(s)
+    return "".join(ch for ch in s if ch == "\n" or (ord(ch) >= 32 and ord(ch) != 127))
+
+def _truncate(s, limit=MAX_CELL_CHARS):
+    s = _clean_text(s)
+    if len(s) <= limit:
+        return s
+    return s[:max(0, limit-10)] + " [..]"
+
+def _split_in_chunks(s, limit=MAX_CELL_CHARS):
+    s = _clean_text(s)
+    if not s:
+        return [""]
+    return [s[i:i+limit] for i in range(0, len(s), limit)]
+
 class ColetorNoticias:
     def __init__(self, timezone_offset_hours=0, deduplicar=True):
         self.tz_offset = timedelta(hours=timezone_offset_hours)
@@ -68,7 +86,7 @@ class ColetorNoticias:
             for c, data in self.clientes.items()
         }
 
-        # Feeds (tudo habilitado)
+        # feeds (tudo habilitado)
         self.feeds = {
             # Base
             'G1 Política': 'https://g1.globo.com/rss/g1/politica/',
@@ -131,7 +149,6 @@ class ColetorNoticias:
             'Folha de Pernambuco': 'https://www.folhape.com.br/?format=feed&type=rss',
         }
 
-    # utilidades
     def _entry_datetime(self, entrada):
         dt = None
         if hasattr(entrada, 'published_parsed') and entrada.published_parsed:
@@ -185,7 +202,6 @@ class ColetorNoticias:
         except Exception:
             return ""
 
-    # coleta
     def coletar_feeds(self, extrair_texto=False, apenas_hoje=True, pausa_seg=0.2):
         total_novas = 0
         print(f"\nIniciando coleta de {len(self.feeds)} fontes...\n" + "=" * 80)
@@ -238,7 +254,6 @@ class ColetorNoticias:
         print(f"Total novas: {total_novas} | Total na sessão: {len(self.df_noticias)}")
         return total_novas
 
-    # Google Sheets
     def _gsheets_client(self):
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
         scopes = ["https://www.googleapis.com/auth/spreadsheets",
@@ -247,12 +262,11 @@ class ColetorNoticias:
         return gspread.authorize(creds)
 
     def _get_or_create_ws(self, sh, title):
-        # título da aba limitado a 31 chars
         name = title[:31]
         try:
             return sh.worksheet(name)
         except gspread.WorksheetNotFound:
-            return sh.add_worksheet(title=name, rows=100, cols=12)
+            return sh.add_worksheet(title=name, rows=100, cols=20)
 
     def _somente_kws_do_cliente(self, cell, cliente):
         d = parse_palavras_por_cliente_cell(cell)
@@ -271,6 +285,18 @@ class ColetorNoticias:
         gc = self._gsheets_client()
         sh = gc.open_by_key(spreadsheet_id)
 
+        # sanitiza/trunca campos textuais comuns
+        for col in ['titulo', 'resumo', 'fonte', 'url']:
+            if col in df.columns:
+                df[col] = df[col].astype(str).map(_truncate)
+
+        # texto_completo: trunca se não for split; se for split, só sanitiza
+        if 'texto_completo' in df.columns:
+            if SHEETS_SPLIT_TEXT:
+                df['texto_completo'] = df['texto_completo'].astype(str).map(_clean_text)
+            else:
+                df['texto_completo'] = df['texto_completo'].astype(str).map(_truncate)
+
         for cliente in self.clientes.keys():
             mask = df['palavras_por_cliente'].astype(str).str.contains(rf'\b{re.escape(cliente)}=', regex=True)
             sub = df[mask].copy()
@@ -281,14 +307,34 @@ class ColetorNoticias:
                     'palavras_por_cliente','resumo','texto_completo','data_coleta'
                 ])
             else:
-                sub['palavras_por_cliente'] = sub['palavras_por_cliente'].apply(
+                sub['palavras_por_cliente'] = sub['palavras_por_cliente'].astype(str).map(
                     lambda cell, c=cliente: self._somente_kws_do_cliente(cell, c)
                 )
 
-            cols = [
-                'data_publicacao','titulo','fonte','url',
-                'palavras_por_cliente','resumo','texto_completo','data_coleta'
-            ]
+                if SHEETS_SPLIT_TEXT and 'texto_completo' in sub.columns:
+                    chunks_cols = []
+
+                    def split_row_text(s):
+                        chunks = _split_in_chunks(s)
+                        nonlocal chunks_cols
+                        while len(chunks_cols) < len(chunks):
+                            chunks_cols.append(f"texto_completo_p{len(chunks_cols)+1}")
+                        return chunks
+
+                    all_chunks = sub['texto_completo'].apply(split_row_text)
+                    for idx, colname in enumerate(chunks_cols):
+                        sub[colname] = all_chunks.apply(lambda lst, i=idx: lst[i] if i < len(lst) else "")
+                    sub.drop(columns=['texto_completo'], inplace=True, errors='ignore')
+
+            base_cols = ['data_publicacao','titulo','fonte','url','palavras_por_cliente','resumo','data_coleta']
+            if SHEETS_SPLIT_TEXT:
+                parts = [c for c in sub.columns if c.startswith('texto_completo_p')]
+                parts.sort(key=lambda x: int(x.rsplit('p',1)[-1]))
+                cols = base_cols[:4] + ['palavras_por_cliente','resumo'] + parts + ['data_coleta']
+            else:
+                cols = base_cols[:4] + ['palavras_por_cliente','resumo','texto_completo','data_coleta']
+
+            cols = [c for c in cols if c in sub.columns]
             sub = sub[cols]
 
             ws = self._get_or_create_ws(sh, cliente)
@@ -298,16 +344,14 @@ class ColetorNoticias:
             set_with_dataframe(ws, sub, include_index=False, include_column_header=True, resize=True)
             print(f"✓ Atualizada aba: {ws.title} ({len(sub)} linhas)")
 
-# Execução standalone
 if __name__ == "__main__":
-    # leitura de envs
     SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
     if not SPREADSHEET_ID:
         print("Defina SPREADSHEET_ID no ambiente.", file=sys.stderr)
         sys.exit(1)
 
     tz = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
-    extrair = os.getenv("EXTRACT_BODY", "1").strip() in ("1", "true", "True", "yes", "on")
+    extrair = os.getenv("EXTRACT_BODY", "1").strip() in ("1","true","True","yes","on")
 
     coletor = ColetorNoticias(
         timezone_offset_hours=tz,
