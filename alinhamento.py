@@ -1,395 +1,247 @@
-import os, re, time, sys
-from datetime import datetime, timedelta, date
+# Alinhamento baseado em título+resumo+texto_completo (todas as abas)
+# - Usa Google Sheets (service account) e Gemini 2.5 Flash
+# - Lê todas as abas; para cada linha com material e sem "Alinhamento", escreve Alinhamento e Justificativa
+# - Robustez: backoff 429, valida JSON, tamanho máx. de célula
 
-import feedparser
+import os, time, json, re, random, html
 import pandas as pd
-from newspaper import Article
-
 import gspread
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
+from google import genai
+from string import Template
 
-# ======== Limites e flags ========
+# ===== Config via env (defaults razoáveis p/ rodar local/Actions) =====
+GENAI_API_KEY = os.getenv("GENAI_API_KEY", "").strip()
+assert GENAI_API_KEY, "Defina o secret GENAI_API_KEY."
+MODEL_NAME = os.getenv("GENAI_MODEL", "gemini-2.5-flash").strip()
+
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID_CLIENTES", "").strip()
+assert SPREADSHEET_ID, "Defina o secret SPREADSHEET_ID_CLIENTES."
+
+CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
+
+# Colunas de entrada (case-insensitive)
+TIT_COL  = os.getenv("ALIGN_COL_TITULO", "titulo")
+RES_COL  = os.getenv("ALIGN_COL_RESUMO", "resumo")
+BODY_COL = os.getenv("ALIGN_COL_TEXTO", "texto_completo")
+
+# Colunas de saída
+OUT_ALINH_COL = os.getenv("ALIGN_COL_SAIDA1", "Alinhamento")
+OUT_JUST_COL  = os.getenv("ALIGN_COL_SAIDA2", "Justificativa")
+
+# Ajustes operacionais
+BATCH_SIZE = int(os.getenv("ALIGN_BATCH_SIZE", "20"))
+SLEEP_SEC  = float(os.getenv("ALIGN_SLEEP_SEC", "0"))
+READ_RANGE = os.getenv("ALIGN_READ_RANGE", "")         # ex: "A1:K2000" se quiser limitar
+SKIP_TITLES = [s.strip() for s in os.getenv("ALIGN_SKIP_TABS", "").split(",") if s.strip()]
+
+# Segurança p/ células do Sheets (limite ~50k)
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
-SHEETS_SPLIT_TEXT = os.getenv("SHEETS_SPLIT_TEXT", "0").strip() in ("1","true","True","yes","on")
 
-# ======== Helpers de limpeza/limite ========
-def _clean_text(s: str) -> str:
-    if s is None: return ""
-    s = str(s)
-    return "".join(ch for ch in s if (ch == "\n") or ((ord(ch) >= 32) and (ord(ch) != 127)))
+# ===== Mapa cliente → (nome, descrição) p/ personalizar análise por aba =====
+ORG_MAP = {
+    "IU": ("Instituto Unibanco (IU)",
+           "O Instituto Unibanco (IU) apoia redes estaduais de ensino na melhoria da gestão educacional por meio de projetos, produção de conhecimento e apoio técnico."),
+    "FMCSV": ("Fundação Maria Cecilia Souto Vidigal (FMCSV)",
+              "Atua pela causa da primeira infância, conectando pesquisa, advocacy e apoio a políticas públicas para o desenvolvimento integral de crianças de 0 a 6 anos."),
+    "IEPS": ("Instituto de Estudos para Políticas de Saúde (IEPS)",
+             "Organização independente dedicada a aprimorar políticas de saúde no Brasil, com foco em atenção primária, saúde digital e financiamento do SUS."),
+    "IAS": ("Instituto Ayrton Senna (IAS)",
+            "Centro de inovação em educação que atua com aprendizagem acadêmica e competências socioemocionais."),
+    "ISG": ("Instituto Sonho Grande (ISG)",
+            "Apoia a expansão e qualificação do ensino médio integral em redes públicas."),
+    "Reúna": ("Instituto Reúna",
+              "Ferramentas e pesquisas para implementação de políticas educacionais alinhadas à BNCC."),
+    "Reuna": ("Instituto Reúna",
+              "Ferramentas e pesquisas para implementação de políticas educacionais alinhadas à BNCC."),
+    "REMS": ("REMS – Rede Esporte pela Mudança Social",
+             "Articula organizações que usam o esporte como vetor de desenvolvimento humano."),
+    "Manual": ("Manual (saúde)",
+               "Plataforma digital voltada à saúde masculina, com atendimento online e tratamentos baseados em evidências."),
+    "Cactus": ("Instituto Cactus",
+               "Atuação independente em saúde mental, priorizando adolescentes e mulheres, via advocacy e fomento."),
+    "Vital Strategies": ("Vital Strategies",
+                         "Organização global de saúde pública que apoia políticas baseadas em evidências."),
+    "Mevo": ("Mevo",
+             "Healthtech que integra soluções de saúde digital do consultório à entrega de medicamentos."),
+    "Coletivo Feminista": ("Coletivo Feminista",
+             "Movimento que atua por direitos reprodutivos e descriminalização do aborto no Brasil."),
+}
 
-def _truncate(s: str, limit: int = MAX_CELL_CHARS) -> str:
-    s = _clean_text(s)
-    return s if len(s) <= limit else s[:max(0, limit - 10)] + " [..]"
+# ===== Prompt (curto e objetivo) =====
+PROMPT = Template("""
+Você é analista de políticas públicas. Avalie a coerência do material abaixo com a missão do(a) $cliente.
 
-def _split_in_chunks(s: str, limit: int = MAX_CELL_CHARS):
-    s = _clean_text(s)
-    if not s: return [""]
-    return [s[i:i + limit] for i in range(0, len(s), limit)]
+Missão e escopo do cliente:
+$cliente_descricao
 
-def _enforce_sheet_limits(df: pd.DataFrame, limit: int = MAX_CELL_CHARS):
+Instruções:
+- Baseie-se exclusivamente no material fornecido (compilado de título, resumo e texto completo).
+- Classifique o alinhamento em um dos três valores: "Alinha", "Parcial" ou "Não Alinha".
+- Escreva uma justificativa breve (1 a 3 frases), objetiva, citando elementos do material.
+- Responda somente em JSON válido, sem comentários.
+
+Formato:
+{"alinhamento":"Alinha|Parcial|Não Alinha","justificativa":"texto"}
+
+Material:
+\"\"\"$material\"\"\"
+""".strip())
+
+# ===== Conexões =====
+genai_client = genai.Client(api_key=GENAI_API_KEY)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
+          "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_file(CREDENTIALS_JSON, scopes=SCOPES)
+gc = gspread.authorize(creds)
+sh = gc.open_by_key(SPREADSHEET_ID)
+
+# ===== Helpers =====
+def norm_find_col(df, name):
+    target = name.strip().lower()
     for c in df.columns:
-        if df[c].dtype == object or str(df[c].dtype).startswith("string"):
-            df[c] = df[c].astype(str).map(lambda v: _truncate(v, limit))
-    return df
+        if c.strip().lower() == target:
+            return c
+    return None
 
-# ======== Mapa Cliente → Tema → Keywords ========
-CLIENT_THEME_DATA = """
-IAS|Educação|Matemática; Alfabetização; Alfabetização Matemática; Recomposição de aprendizagem; Plano Nacional de Educação
-ISG|Educação|Tempo Integral; Ensino em tempo integral; Ensino Profissional e Tecnológico; Fundeb; PROPAG; Educação em tempo integral; Escola em tempo integral; Plano Nacional de Educação; Programa escola em tempo integral; Programa Pé-de-meia; PNEERQ; INEP; FNDE; Conselho Nacional de Educação; PDDE; Programa de Fomento às Escolas de Ensino Médio em Tempo Integral; Celular nas escolas; Juros da Educação
-IU|Educação|Gestão Educacional; Diretores escolares; Magistério; Professores ensino médio; Sindicatos de professores; Ensino Médio; Fundeb; Adaptações de Escolas; Educação Ambiental; Plano Nacional de Educação; PDDE; Programa Pé de Meia; INEP; FNDE; Conselho Nacional de Educação; VAAT; VAAR; Secretaria Estadual de Educação; Celular nas escolas; EAD; Juro da educação; Recomposição de Aprendizagem
-Reúna|Educação|Matemática; Alfabetização; Alfabetização Matemática; Recomposição de aprendizagem; Plano Nacional de Educação; Emendas parlamentares educação
-REMS|Esportes|Esporte amador; Esporte para toda a vida; Esporte e desenvolvimento social; Financiamento do esporte; Lei de Incentivo ao Esporte; Plano Nacional de Esporte; Conselho Nacional de Esporte; Emendas parlamentares esporte
-FMCSV|Primeira infância|Criança; Infância; infanto-juvenil; educação básica; PNE; FNDE; Fundeb; VAAR; VAAT; educação infantil; maternidade; paternidade; alfabetização; creche; pré-escola; parentalidade; materno-infantil; infraestrutura escolar; política nacional de cuidados; Plano Nacional de Educação; Bolsa Família; Conanda; visitação domiciliar; Homeschooling; Política Nacional Integrada da Primeira Infância
-IEPS|Saúde|SUS; Sistema Único de Saúde; fortalecimento; Universalidade; Equidade em saúde; populações vulneráveis; desigualdades sociais; Organização do SUS; gestão pública; políticas públicas em saúde; Governança do SUS; regionalização; descentralização; Regionalização em saúde; Políticas públicas em saúde; População negra em saúde; Saúde indígena; Povos originários; Saúde da pessoa idosa; envelhecimento ativo; Atenção Primária; Saúde da criança; Saúde do adolescente; Saúde da mulher; Saúde da homem; Saúde da pessoa com deficiência; Saúde da população LGBTQIA+; Financiamento da saúde; atenção primária; tripartite; orçamento; Emendas e orçamento da saúde; Ministério da Saúde; Trabalhadores de saúde; Força de trabalho em saúde; Recursos humanos em saúde; Formação profissional de saúde; Cuidados primários em saúde; Emergências climáticas e ambientais em saúde; mudanças climáticas; adaptação climática; saúde ambiental; políticas climáticas; Vigilância em saúde; epidemiológica; Emergência em saúde; estado de emergência; Saúde suplementar; complementar; privada; planos de saúde; seguros; seguradoras; planos populares; Anvisa; gestão; governança; ANS; Sandbox regulatório; Cartões e administradoras de benefícios em saúde; Economia solidária em saúde mental; Pessoa em situação de rua; saúde mental; Fiscalização de comunidades terapêuticas; Rede de atenção psicossocial; RAPS; unidades de acolhimento; assistência multiprofissional; centros de convivência; Cannabis; canabidiol; tratamento terapêutico; Desinstitucionalização; manicômios; hospitais de custódia; Saúde mental na infância; adolescência; escolas; comunidades escolares; protagonismo juvenil; Dependência química; vícios; ludopatia; Treinamento em saúde mental; capacitação em saúde mental; Intervenções terapêuticas em saúde mental; Internet e redes sociais na saúde mental; Violência psicológica; Surto psicótico
-Manual|Saúde|Ozempic; Wegovy; Mounjaro; Telemedicina; Telessaúde; CBD; Cannabis Medicinal; CFM; Conselho Federal de Medicina; Farmácia Magistral; Medicamentos Manipulados; Minoxidil; Emagrecedores; Retenção de receita de medicamentos
-Mevo|Saúde|Prontuário eletrônico; dispensação eletrônica; telessaúde; assinatura digital; certificado digital; controle sanitário; prescrição por enfermeiros; doenças crônicas; autonomia da ANPD; Acesso e uso de dados; responsabilização de plataformas digitais; regulamentação de marketplaces; segurança cibernética; inteligência artificial; digitalização do SUS; venda de medicamentos; distribuição de medicamentos; Bula digital; Atesta CFM; SNGPC; Farmacêutico Remoto; Medicamentos Isentos de Prescrição; MIPs; RNDS; Rede Nacional de Dados em Saúde
-Cactus|Saúde|Saúde mental; saúde mental para meninas; saúde mental para juventude; saúde mental para mulheres; Rede de atenção psicossocial; RAPS; CAPS; Centro de Apoio Psicossocial
-Vital Strategies|Saúde|Saúde mental; Dados para a saúde; Morte evitável; Doenças crônicas não transmissíveis; Rotulagem de bebidas alcoólicas; Educação em saúde; Bebidas alcoólicas; Metanol; Imposto seletivo; Rotulagem de alimentos; Alimentos ultraprocessados; Publicidade infantil; Publicidade de alimentos ultraprocessados; Tributação de bebidas alcoólicas; Alíquota de bebidas alcoólicas; Cigarro eletrônico; Controle de tabaco; Violência doméstica; Exposição a fatores de risco; Departamento de Saúde Mental; Hipertensão arterial; Saúde digital; Violência contra crianças; Violência contra mulheres; Feminicídio; COP 30
-Coletivo Feminista|Direitos reprodutivos|aborto; nascituro; gestação acima de 22 semanas; interrupção legal da gestação; interrupção da gestação; Resolução 258 Conanda; vida por nascer; vida desde a concepção; criança por nascer; infanticídio; feticídio; assistolia fetal; medicamento abortivo; misoprostol; citotec; cytotec; mifepristona; ventre; assassinato de bebês; luto parental; síndrome pós aborto
-""".strip()
+def strip_html(text: str) -> str:
+    if not isinstance(text, str): return ""
+    t = html.unescape(text)
+    t = re.sub(r"<[^>]+>", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
 
-def parse_client_theme_data(raw: str):
-    mapping = {}
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line or '|' not in line:
-            continue
-        cliente, tema, keywords_str = [x.strip() for x in line.split('|', 2)]
-        keywords = [k.strip() for k in keywords_str.split(';') if k.strip()]
-        mapping[cliente] = {'tema': tema, 'keywords': keywords}
-    return mapping
+def _truncate_cell(s: str, limit: int = MAX_CELL_CHARS) -> str:
+    s = str(s) if s is not None else ""
+    return s if len(s) <= limit else s[: max(0, limit - 10)] + " [..]"
 
-def make_wholeword_pattern(term: str):
-    return re.compile(rf'\b{re.escape(term)}\b', flags=re.IGNORECASE)
+def build_material(row, tit_col, res_col, body_col) -> str:
+    t = strip_html(row.get(tit_col, ""))
+    r = strip_html(row.get(res_col, ""))
+    b = strip_html(row.get(body_col, ""))
+    parts = []
+    if t: parts.append(f"Título: {t}")
+    if r: parts.append(f"Resumo: {r}")
+    if b: parts.append(f"Texto: {b}")
+    material = "\n\n".join(parts).strip()
+    # evita mandar prompts gigantes: corta em ~12k chars
+    if len(material) > 12000:
+        material = material[:11990] + " [..]"
+    return material
 
-def parse_palavras_por_cliente_cell(cell: str):
-    # Ex.: "IAS=PNE|Alfabetização; IEPS=SUS"
-    out = {}
-    if not isinstance(cell, str) or not cell.strip():
-        return out
-    parts = [p.strip() for p in cell.split(';') if p.strip()]
-    for part in parts:
-        if '=' not in part:
-            continue
-        k, v = part.split('=', 1)
-        k = k.strip()
-        kws = [x.strip() for x in v.split('|') if x.strip()]
-        out[k] = kws
-    return out
-
-class ColetorNoticias:
-    def __init__(self, timezone_offset_hours=0, deduplicar=True):
-        self.tz_offset = timedelta(hours=timezone_offset_hours)
-        self.deduplicar = deduplicar
-        self._seen_urls = set()
-        self.df_noticias = pd.DataFrame(columns=[
-            'data_publicacao','titulo','fonte','url',
-            'palavras_por_cliente','resumo','texto_completo','data_coleta'
-        ])
-        self.clientes = parse_client_theme_data(CLIENT_THEME_DATA)
-        self.cliente_patterns = {
-            c: [make_wholeword_pattern(k) for k in data['keywords']]
-            for c, data in self.clientes.items()
-        }
-
-        self.feeds = {
-            'G1 Política': 'https://g1.globo.com/rss/g1/politica/',
-            'Folha Poder': 'https://feeds.folha.uol.com.br/poder/rss091.xml',
-            'Estadão Política': 'https://politica.estadao.com.br/rss.xml',
-            'O Globo Brasil': 'https://oglobo.globo.com/brasil/rss.xml',
-            'UOL Notícias': 'https://rss.uol.com.br/feed/noticias.xml',
-            'CNN Brasil': 'https://www.cnnbrasil.com.br/feed/',
-            'Congresso em Foco': 'https://congressoemfoco.uol.com.br/feed/',
-            'Poder360': 'https://www.poder360.com.br/feed/',
-            'Metrópoles': 'https://www.metropoles.com/feed',
-            'O Antagonista': 'https://www.oantagonista.com/feed/',
-            'CartaCapital': 'https://www.cartacapital.com.br/feed/',
-            'Nexo Jornal': 'https://www.nexojornal.com.br/rss.xml',
-            'InfoMoney': 'https://www.infomoney.com.br/feed/',
-            'Exame (via Google News)': 'https://news.google.com/rss/search?q=site:exame.com',
-            'Money Times': 'https://www.moneytimes.com.br/feed/',
-            'Agência Câmara': 'https://www.camara.leg.br/noticias/rss',
-            'FolhaPE (home)': 'https://www.folhape.com.br/?format=feed&type=rss',
-            'FolhaPE Política': 'https://www.folhape.com.br/politica/?format=feed&type=rss',
-            'Diario de Pernambuco (via Google News)': 'https://news.google.com/rss/search?q=site:diariodepernambuco.com.br',
-            'JC Online / NE10 (via Google News)': 'https://news.google.com/rss/search?q=site:jc.ne10.uol.com.br',
-            'Valor Econômico': 'https://valor.globo.com/rss/',
-            'BBC Brasil – Política (topics)': 'https://www.bbc.com/portuguese/topics/cq23pdgvg85t/rss.xml',
-            'Correio Braziliense': 'https://www.correiobraziliense.com.br/rss/',
-            'Gazeta do Povo Política': 'https://www.gazetadopovo.com.br/politica/rss/',
-            'Revista Veja Política': 'https://veja.abril.com.br/rss/politica.xml',
-            'IstoÉ Política': 'https://istoe.com.br/assuntos/politica/feed/',
-            'Planalto (via GN)': 'https://news.google.com/rss/search?q=site:gov.br/planalto',
-            'Casa Civil (via GN)': 'https://news.google.com/rss/search?q=site:gov.br/casacivil',
-            'Ministério da Educação (via GN)': 'https://news.google.com/rss/search?q=site:gov.br/mec',
-            'FNDE (via GN)': 'https://news.google.com/rss/search?q=site:gov.br/fnde',
-            'Ministério da Saúde (via GN)': 'https://news.google.com/rss/search?q=site:gov.br/saude',
-            'Anvisa (via GN)': 'https://news.google.com/rss/search?q=site:gov.br/anvisa',
-            'Conass (via GN)': 'https://news.google.com/rss/search?q=site:conass.org.br',
-            'Conasems (via GN)': 'https://news.google.com/rss/search?q=site:conasems.org.br',
-            'INEP (via GN)': 'https://news.google.com/rss/search?q=site:inep.gov.br',
-            'CNE (via GN)': 'https://news.google.com/rss/search?q=site:portal.mec.gov.br/conselho-nacional-de-educacao',
-            'Revista Piauí': 'https://piaui.folha.uol.com.br/feed/',
-            'Todos Pela Educação (via GN)': 'https://news.google.com/rss/search?q=site:todospelaeducacao.org.br',
-            'Observatório do PNE (via GN)': 'https://news.google.com/rss/search?q=site:observatoriodopne.org.br',
-            'CENPEC (via GN)': 'https://news.google.com/rss/search?q=site:cenpec.org.br',
-            'Andifes (via GN)': 'https://news.google.com/rss/search?q=site:andifes.org.br',
-            'CAPES (via GN)': 'https://news.google.com/rss/search?q=site:capes.gov.br',
-            'Fiocruz': 'https://portal.fiocruz.br/rss.xml',
-            'Instituto Butantan (via GN)': 'https://news.google.com/rss/search?q=site:butantan.gov.br',
-            'OPAS/OMS Brasil (via GN)': 'https://news.google.com/rss/search?q=site:paho.org/brasil',
-            'O Povo': 'https://www.opovo.com.br/rss/rss.xml',
-            'Correio da Bahia': 'https://www.correio24horas.com.br/rss/',
-            'Folha de Pernambuco': 'https://www.folhape.com.br/?format=feed&type=rss',
-        }
-
-    def _entry_datetime(self, entrada):
-        dt = None
-        if hasattr(entrada, 'published_parsed') and entrada.published_parsed:
-            dt = datetime(*entrada.published_parsed[:6])
-        elif hasattr(entrada, 'updated_parsed') and entrada.updated_parsed:
-            dt = datetime(*entrada.updated_parsed[:6])
-        elif 'published' in entrada:
-            dt = pd.to_datetime(entrada.published, errors='coerce')
-            dt = None if pd.isna(dt) else dt.to_pydatetime()
-        elif 'updated' in entrada:
-            dt = pd.to_datetime(entrada.updated, errors='coerce')
-            dt = None if pd.isna(dt) else dt.to_pydatetime()
-        return dt + self.tz_offset if dt else None
-
-    def _eh_hoje(self, dt_obj):
-        return bool(dt_obj) and dt_obj.date() == date.today()
-
-    def _hits_por_cliente(self, texto):
-        hits = {}
-        base = texto or ""
-        for cliente, patterns in self.cliente_patterns.items():
-            ks = []
-            for pat, kw in zip(patterns, self.clientes[cliente]['keywords']):
-                if pat.search(base):
-                    ks.append(kw)
-            if ks:
-                hits[cliente] = ks
-        return hits
-
-    def _format_palavras_por_cliente(self, hits_dict):
-        return "; ".join(f"{cli}=" + "|".join(kws) for cli, kws in hits_dict.items())
-
-    def noticia_existe(self, url):
-        if not self.deduplicar: return False
-        return (url in self._seen_urls) or (not self.df_noticias.empty and url in self.df_noticias['url'].values)
-
-    def adicionar_noticia(self, noticia):
-        if self.noticia_existe(noticia['url']): return False
-        self._seen_urls.add(noticia['url'])
-        self.df_noticias = pd.concat([self.df_noticias, pd.DataFrame([noticia])], ignore_index=True)
-        return True
-
-    def extrair_texto_completo(self, url):
-        try:
-            art = Article(url, language='pt')
-            art.download(); art.parse()
-            return art.text
-        except Exception:
-            return ""
-
-    def coletar_feeds(self, extrair_texto=False, apenas_hoje=True, pausa_seg=0.2):
-        total_novas = 0
-        print(f"\nIniciando coleta de {len(self.feeds)} fontes...\n" + "=" * 80)
-        for nome_fonte, feed_url in self.feeds.items():
-            print(f"\nProcessando: {nome_fonte}")
-            try:
-                feed = feedparser.parse(feed_url)
-                novos = 0
-                for e in feed.entries:
-                    titulo = e.get('title', 'Sem título')
-                    url = e.get('link', '')
-                    resumo = e.get('summary', '')
-
-                    dt_pub = self._entry_datetime(e)
-                    if apenas_hoje and not self._eh_hoje(dt_pub):
-                        continue
-
-                    if extrair_texto:
-                        corpo = self.extrair_texto_completo(url)
-                        base_match = f"{titulo} {resumo} {corpo}"
-                    else:
-                        corpo = ''
-                        base_match = f"{titulo} {resumo}"
-
-                    hits_clientes = self._hits_por_cliente(base_match)
-                    if not hits_clientes:
-                        continue
-
-                    noticia = {
-                        'data_publicacao': dt_pub.strftime('%Y-%m-%d %H:%M:%S') if dt_pub else '',
-                        'titulo': titulo,
-                        'fonte': nome_fonte,
-                        'url': url,
-                        'palavras_por_cliente': self._format_palavras_por_cliente(hits_clientes),
-                        'resumo': resumo,
-                        'texto_completo': corpo,
-                        'data_coleta': (datetime.now() + self.tz_offset).strftime('%Y-%m-%d %H:%M:%S'),
-                    }
-
-                    if self.adicionar_noticia(noticia):
-                        novos += 1
-                        total_novas += 1
-                        if pausa_seg: time.sleep(pausa_seg)
-                print(f"  ✓ {novos} novas")
-            except Exception as ex:
-                print(f"  ✗ Erro em {nome_fonte}: {ex}")
-
-        print("\n" + "=" * 80)
-        print(f"Total novas: {total_novas} | Total na sessão: {len(self.df_noticias)}")
-        return total_novas
-
-    # ==== Google Sheets ====
-    def _gsheets_client(self):
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
-        scopes = ["https://www.googleapis.com/auth/spreadsheets",
-                  "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-        return gspread.authorize(creds)
-
-    def _get_or_create_ws(self, sh, title):
-        name = title[:31]
-        try:
-            return sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            return sh.add_worksheet(title=name, rows=100, cols=20)
-
-    def _somente_kws_do_cliente(self, cell, cliente):
-        try:
-            d = parse_palavras_por_cliente_cell(cell)
-            return "|".join(d.get(cliente, []))
-        except Exception:
-            return ""
-
-    def _read_ws_df(self, ws):
-        values = ws.get_all_values()
-        if not values: return pd.DataFrame()
-        header, rows = values[0], values[1:]
-        if not any(h.strip() for h in header): return pd.DataFrame()
+def read_sheet_df(ws, read_range: str = "") -> pd.DataFrame:
+    def _once():
+        vals = ws.get(read_range) if read_range else ws.get_all_values()
+        if not vals: return pd.DataFrame()
+        header, data = vals[0], vals[1:]
         width = len(header)
-        norm_rows = [r + [""] * (width - len(r)) for r in rows]
-        return pd.DataFrame(norm_rows, columns=[h.strip() for h in header])
+        data = [row + [""] * (width - len(row)) for row in data]
+        return pd.DataFrame(data, columns=[h.strip() for h in header])
+    delay = 1.0
+    for _ in range(6):
+        try:
+            return _once()
+        except gspread.exceptions.APIError as e:
+            msg = str(e)
+            if "429" in msg or "Quota exceeded" in msg:
+                time.sleep(delay + random.random()*0.25)
+                delay = min(delay*2, 20)
+                continue
+            raise
+    return _once()
 
-    def _ensure_header(self, ws, columns):
-        values = ws.get_all_values()
-        if not values or not values[0] or not any(v.strip() for v in values[0]):
-            tmp = pd.DataFrame(columns=columns)
-            set_with_dataframe(ws, tmp, include_index=False, include_column_header=True, resize=True)
-            return True
-        return False
+def call_gemini(prompt_text: str) -> dict:
+    delay = 1.0
+    for _ in range(5):
+        try:
+            stream = genai_client.models.generate_content_stream(
+                model=MODEL_NAME,
+                contents=prompt_text,
+                config={"response_mime_type": "application/json"},
+            )
+            raw = "".join((chunk.text or "") for chunk in stream).strip()
+            m = re.search(r"\{.*\}", raw, flags=re.S)
+            if not m:
+                return {"alinhamento": "Parcial", "justificativa": "Saída sem JSON; revisar."}
+            data = json.loads(m.group(0))
+            alinh = str(data.get("alinhamento", "")).strip() or "Parcial"
+            just  = str(data.get("justificativa", "")).strip() or "Sem justificativa; revisar."
+            if alinh not in ("Alinha", "Parcial", "Não Alinha"):
+                alinh = "Parcial"
+            return {"alinhamento": alinh, "justificativa": just}
+        except Exception:
+            time.sleep(delay + random.random()*0.25)
+            delay = min(delay*2, 20)
+    return {"alinhamento": "Parcial", "justificativa": "Falha após tentativas; revisar."}
 
-    def exportar_por_cliente_para_sheets(self, spreadsheet_id: str, apenas_hoje=True):
-        if self.df_noticias.empty:
-            print("Sem notícias para exportar."); return
+def classify_material(material: str, nome_cli: str, desc_cli: str) -> dict:
+    if not material:
+        return {"alinhamento": "Parcial",
+                "justificativa": "Sem conteúdo em título, resumo ou texto; não é possível concluir o alinhamento."}
+    prompt_text = PROMPT.substitute(cliente=nome_cli, cliente_descricao=desc_cli, material=material)
+    return call_gemini(prompt_text)
 
-        df = self.df_noticias.copy()
-        if apenas_hoje:
-            hoje = date.today().strftime('%Y-%m-%d')
-            df = df[df['data_publicacao'].astype(str).str.startswith(hoje)]
+def process_sheet(ws):
+    title = ws.title.strip()
+    if title in SKIP_TITLES:
+        print(f"⏭️  Pulando aba '{title}'."); return
 
-        gc = self._gsheets_client()
-        sh = gc.open_by_key(spreadsheet_id)
+    nome_cli, desc_cli = ORG_MAP.get(title, (title, ""))
 
-        for col in ['titulo','resumo','fonte','url']:
-            if col in df.columns:
-                df[col] = df[col].astype(str).map(_truncate)
+    print(f"\n▶️  Aba: {title} | Cliente: {nome_cli}")
+    df = read_sheet_df(ws, READ_RANGE)
+    if df.empty:
+        print(f"[{title}] vazia — pulando."); return
 
-        if 'texto_completo' in df.columns:
-            if SHEETS_SPLIT_TEXT:
-                df['texto_completo'] = df['texto_completo'].astype(str).map(_clean_text)
-            else:
-                df['texto_completo'] = df['texto_completo'].astype(str).map(_truncate)
+    df.columns = [c.strip() for c in df.columns]
 
-        for cliente in self.clientes.keys():
-            mask = df['palavras_por_cliente'].astype(str).str.contains(rf'\b{re.escape(cliente)}=', regex=True)
-            sub = df[mask].copy()
+    tit_col  = norm_find_col(df, TIT_COL)
+    res_col  = norm_find_col(df, RES_COL)
+    body_col = norm_find_col(df, BODY_COL)
 
-            if not sub.empty:
-                sub['palavras_por_cliente'] = sub['palavras_por_cliente'].astype(str).map(
-                    lambda cell, c=cliente: self._somente_kws_do_cliente(cell, c)
-                )
+    if not any([tit_col, res_col, body_col]):
+        print(f"[{title}] não achei '{TIT_COL}', '{RES_COL}' ou '{BODY_COL}' — pulando.")
+        return
 
-            if SHEETS_SPLIT_TEXT and 'texto_completo' in sub.columns:
-                parts_cols = []
-                def split_row_text(s):
-                    chunks = _split_in_chunks(s)
-                    nonlocal parts_cols
-                    while len(parts_cols) < len(chunks):
-                        parts_cols.append(f"texto_completo_p{len(parts_cols)+1}")
-                    return chunks
-                all_chunks = sub['texto_completo'].apply(split_row_text) if not sub.empty else pd.Series([], dtype=object)
-                for idx, colname in enumerate(parts_cols):
-                    sub[colname] = all_chunks.apply(lambda lst, i=idx: lst[i] if i < len(lst) else "") if not all_chunks.empty else []
-                sub.drop(columns=['texto_completo'], inplace=True, errors='ignore')
+    if OUT_ALINH_COL not in df.columns:
+        df[OUT_ALINH_COL] = ""
+    if OUT_JUST_COL not in df.columns:
+        df[OUT_JUST_COL] = ""
 
-            base_cols = ['data_publicacao','titulo','fonte','url','palavras_por_cliente','resumo','data_coleta']
-            if SHEETS_SPLIT_TEXT:
-                parts = [c for c in sub.columns if c.startswith('texto_completo_p')]
-                parts.sort(key=lambda x: int(x.rsplit('p',1)[-1]))
-                cols = base_cols[:4] + ['palavras_por_cliente','resumo'] + parts + ['data_coleta']
-            else:
-                cols = base_cols[:4] + ['palavras_por_cliente','resumo','texto_completo','data_coleta']
+    def row_has_material(i):
+        cols = [c for c in [tit_col, res_col, body_col] if c]
+        return any(str(df.at[i, c]).strip() for c in cols)
 
-            cols = [c for c in cols if c in sub.columns] if not sub.empty else cols
-            sub = sub[cols] if not sub.empty else pd.DataFrame(columns=cols)
-            sub = _enforce_sheet_limits(sub, MAX_CELL_CHARS)
+    to_process = [i for i in range(len(df))
+                  if not str(df.at[i, OUT_ALINH_COL]).strip() and row_has_material(i)]
 
-            ws = self._get_or_create_ws(sh, cliente)
-            self._ensure_header(ws, cols)
+    print(f"[{title}] linhas para classificar: {len(to_process)}")
+    if not to_process:
+        return
 
-            # dedup contra o que já está na planilha (por URL)
-            existing_df = self._read_ws_df(ws)
-            existing_urls = set()
-            for c in existing_df.columns:
-                if c.strip().lower() == "url":
-                    existing_urls = set(existing_df[c].astype(str).tolist())
-                    break
-            if not sub.empty and "url" in sub.columns:
-                sub = sub[~sub["url"].astype(str).isin(existing_urls)]
-            if sub.empty:
-                print(f"✓ Aba {ws.title}: nada novo para inserir."); continue
+    for start in range(0, len(to_process), BATCH_SIZE):
+        batch_idx = to_process[start:start+BATCH_SIZE]
+        for i in batch_idx:
+            material = build_material(df.loc[i], tit_col, res_col, body_col)
+            res = classify_material(material, nome_cli, desc_cli)
+            df.at[i, OUT_ALINH_COL] = _truncate_cell(res["alinhamento"], MAX_CELL_CHARS)
+            df.at[i, OUT_JUST_COL]  = _truncate_cell(res["justificativa"], MAX_CELL_CHARS)
+            if SLEEP_SEC:
+                time.sleep(SLEEP_SEC)
 
-            # se a aba só tem cabeçalho (ou está vazia), NÃO usa insert_rows (evita startIndex==grid size)
-            if len(existing_df) == 0:
-                set_with_dataframe(
-                    ws, sub, row=2, col=1,
-                    include_index=False, include_column_header=False, resize=True
-                )
-                print(f"✓ Inseridas {len(sub)} linhas (aba estava vazia): {ws.title}")
-            else:
-                # insere espaço no topo e grava
-                ws.insert_rows([[]] * len(sub), row=2, value_input_option="RAW")
-                set_with_dataframe(
-                    ws, sub, row=2, col=1,
-                    include_index=False, include_column_header=False, resize=False
-                )
-                print(f"✓ Inseridas {len(sub)} linhas no topo da aba: {ws.title}")
+        # salva até a última linha do lote
+        set_with_dataframe(ws, df.iloc[:max(batch_idx)+1],
+                           include_index=False, include_column_header=True, resize=False)
+        print(f"[{title}] 💾 salvo linhas até {max(batch_idx)+2}")
 
-# ======== Main ========
+def main():
+    worksheets = sh.worksheets()
+    if not worksheets:
+        print("Planilha sem abas."); return
+    for ws in worksheets:
+        process_sheet(ws)
+    print("\n✅ Concluído (todas as abas).")
+
 if __name__ == "__main__":
-    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
-    if not SPREADSHEET_ID:
-        print("Defina SPREADSHEET_ID no ambiente.", file=sys.stderr); sys.exit(1)
-
-    tz = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
-    extrair = os.getenv("EXTRACT_BODY", "1").strip() in ("1","true","True","yes","on")
-
-    coletor = ColetorNoticias(timezone_offset_hours=tz, deduplicar=True)
-
-    coletor.coletar_feeds(
-        extrair_texto=extrair,
-        apenas_hoje=True,
-        pausa_seg=0.2
-    )
-
-    coletor.exportar_por_cliente_para_sheets(
-        spreadsheet_id=SPREADSHEET_ID,
-        apenas_hoje=True
-    )
+    main()
