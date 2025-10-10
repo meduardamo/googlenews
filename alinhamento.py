@@ -11,13 +11,13 @@ from google.oauth2.service_account import Credentials
 from google import genai
 from string import Template
 
-# ===== Config via env (defaults razoáveis p/ rodar local/Actions) =====
+# Config via env
 GENAI_API_KEY = os.getenv("GENAI_API_KEY", "").strip()
 assert GENAI_API_KEY, "Defina o secret GENAI_API_KEY."
 MODEL_NAME = os.getenv("GENAI_MODEL", "gemini-2.5-flash").strip()
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID_CLIENTES", "").strip()
-assert SPREADSHEET_ID, "Defina o secret SPREADSHEET_ID_CLIENTES."
+PLANILHA = os.getenv("PLANILHA", "").strip()
+assert PLANILHA, "Defina o secret PLANILHA (ID da planilha do Google Sheets)."
 
 CREDENTIALS_JSON = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
 
@@ -33,13 +33,13 @@ OUT_JUST_COL  = os.getenv("ALIGN_COL_SAIDA2", "Justificativa")
 # Ajustes operacionais
 BATCH_SIZE = int(os.getenv("ALIGN_BATCH_SIZE", "20"))
 SLEEP_SEC  = float(os.getenv("ALIGN_SLEEP_SEC", "0"))
-READ_RANGE = os.getenv("ALIGN_READ_RANGE", "")         # ex: "A1:K2000" se quiser limitar
+READ_RANGE = os.getenv("ALIGN_READ_RANGE", "")
 SKIP_TITLES = [s.strip() for s in os.getenv("ALIGN_SKIP_TABS", "").split(",") if s.strip()]
 
 # Segurança p/ células do Sheets (limite ~50k)
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 
-# ===== Mapa cliente → (nome, descrição) p/ personalizar análise por aba =====
+# Mapa cliente → (nome, descrição) p/ personalizar análise por aba
 ORG_MAP = {
     "IU": ("Instituto Unibanco (IU)",
            "O Instituto Unibanco (IU) apoia redes estaduais de ensino na melhoria da gestão educacional por meio de projetos, produção de conhecimento e apoio técnico."),
@@ -69,7 +69,7 @@ ORG_MAP = {
              "Movimento que atua por direitos reprodutivos e descriminalização do aborto no Brasil."),
 }
 
-# ===== Prompt (curto e objetivo) =====
+# Prompt
 PROMPT = Template("""
 Você é analista de políticas públicas. Avalie a coerência do material abaixo com a missão do(a) $cliente.
 
@@ -89,15 +89,15 @@ Material:
 \"\"\"$material\"\"\"
 """.strip())
 
-# ===== Conexões =====
+# Conexões
 genai_client = genai.Client(api_key=GENAI_API_KEY)
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]
 creds = Credentials.from_service_account_file(CREDENTIALS_JSON, scopes=SCOPES)
 gc = gspread.authorize(creds)
-sh = gc.open_by_key(SPREADSHEET_ID)
+sh = gc.open_by_key(PLANILHA)
 
-# ===== Helpers =====
+# Helpers
 def norm_find_col(df, name):
     target = name.strip().lower()
     for c in df.columns:
@@ -125,7 +125,6 @@ def build_material(row, tit_col, res_col, body_col) -> str:
     if r: parts.append(f"Resumo: {r}")
     if b: parts.append(f"Texto: {b}")
     material = "\n\n".join(parts).strip()
-    # evita mandar prompts gigantes: corta em ~12k chars
     if len(material) > 12000:
         material = material[:11990] + " [..]"
     return material
@@ -230,7 +229,6 @@ def process_sheet(ws):
             if SLEEP_SEC:
                 time.sleep(SLEEP_SEC)
 
-        # salva até a última linha do lote
         set_with_dataframe(ws, df.iloc[:max(batch_idx)+1],
                            include_index=False, include_column_header=True, resize=False)
         print(f"[{title}] 💾 salvo linhas até {max(batch_idx)+2}")
