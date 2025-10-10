@@ -1,23 +1,6 @@
-# Web Scraping
-selenium==4.23.1
-webdriver-manager==4.0.1
-beautifulsoup4==4.12.3
-
-# Data Processing
-pandas==2.2.2
-openpyxl==3.1.2
-
-# Google Sheets Integration
-gspread==6.1.2
-gspread-dataframe==4.0.0
-google-auth==2.29.0
-
-# Utilities
-tqdm==4.66.4
-requests==2.31.0
-urllib3==2.2.2
-
-# Core dependencies (usually included but explicit for clarity)
-lxml==5.2.2
-html5lib==1.1
-chardet==5.2.0
+feedparser
+newspaper3k
+pandas
+gspread
+gspread-dataframe
+google-auth
