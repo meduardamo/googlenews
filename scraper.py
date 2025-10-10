@@ -2,6 +2,7 @@
 # - Sem CSV/XLSX.
 # - Cada aba mostra só as keywords do próprio cliente.
 # - Blindagem 50k chars por célula (truncamento) + opção de split do texto em p1..pN.
+# - INSERE novas linhas no topo (linha 2), não sobrescreve e não duplica (chave: URL).
 
 import os, re, time, sys
 from datetime import datetime, timedelta, date
@@ -78,14 +79,18 @@ def make_wholeword_pattern(term: str):
     return re.compile(rf'\b{re.escape(term)}\b', flags=re.IGNORECASE)
 
 def parse_palavras_por_cliente_cell(cell: str):
+    # Ex.: "IAS=PNE|Alfabetização; IEPS=SUS"
     out = {}
     if not isinstance(cell, str) or not cell.strip():
         return out
-    for part in [p.strip() for p in cell.split(';') if p.strip()]:
-        if '=' in part:
-            k, v = part.split('=', 1)
-            out[k].strip()
-            out[k.strip()] = [x.strip() for x in v.split('|') if x.strip()]
+    parts = [p.strip() for p in cell.split(';') if p.strip()]
+    for part in parts:
+        if '=' not in part:
+            continue
+        k, v = part.split('=', 1)
+        k = k.strip()
+        kws = [x.strip() for x in v.split('|') if x.strip()]
+        out[k] = kws
     return out
 
 class ColetorNoticias:
@@ -200,7 +205,7 @@ class ColetorNoticias:
     def _format_palavras_por_cliente(self, hits_dict):
         return "; ".join(f"{cli}=" + "|".join(kws) for cli, kws in hits_dict.items())
 
-    # ==== dedup ====
+    # ==== dedup interno ====
     def noticia_existe(self, url):
         if not self.deduplicar:
             return False
@@ -292,10 +297,35 @@ class ColetorNoticias:
             return sh.add_worksheet(title=name, rows=100, cols=20)
 
     def _somente_kws_do_cliente(self, cell, cliente):
-        d = parse_palavras_por_cliente_cell(cell)
-        return "|".join(d.get(cliente, []))
+        try:
+            d = parse_palavras_por_cliente_cell(cell)
+            return "|".join(d.get(cliente, []))
+        except Exception:
+            return ""
 
-    def exportar_por_cliente_para_sheets(self, spreadsheet_id: str, apenas_hoje=True, clear=True):
+    def _read_ws_df(self, ws):
+        values = ws.get_all_values()
+        if not values:
+            return pd.DataFrame()
+        header, rows = values[0], values[1:]
+        if not any(h.strip() for h in header):
+            return pd.DataFrame()
+        # normaliza largura
+        width = len(header)
+        norm_rows = [r + [""] * (width - len(r)) for r in rows]
+        df = pd.DataFrame(norm_rows, columns=[h.strip() for h in header])
+        return df
+
+    def _ensure_header(self, ws, columns):
+        # se a primeira linha não tiver cabeçalho, escreve
+        values = ws.get_all_values()
+        if not values or not values[0] or not any(v.strip() for v in values[0]):
+            tmp = pd.DataFrame(columns=columns)
+            set_with_dataframe(ws, tmp, include_index=False, include_column_header=True, resize=True)
+            return True
+        return False
+
+    def exportar_por_cliente_para_sheets(self, spreadsheet_id: str, apenas_hoje=True):
         if self.df_noticias.empty:
             print("Sem notícias para exportar.")
             return
@@ -324,32 +354,27 @@ class ColetorNoticias:
             mask = df['palavras_por_cliente'].astype(str).str.contains(rf'\b{re.escape(cliente)}=', regex=True)
             sub = df[mask].copy()
 
-            if sub.empty:
-                sub = pd.DataFrame(columns=[
-                    'data_publicacao','titulo','fonte','url',
-                    'palavras_por_cliente','resumo','texto_completo','data_coleta'
-                ])
-            else:
-                # mantém só as keywords do cliente
+            # mantém só as keywords do cliente
+            if not sub.empty:
                 sub['palavras_por_cliente'] = sub['palavras_por_cliente'].astype(str).map(
                     lambda cell, c=cliente: self._somente_kws_do_cliente(cell, c)
                 )
 
-                # split opcional do texto em p1..pN
-                if SHEETS_SPLIT_TEXT and 'texto_completo' in sub.columns:
-                    parts_cols = []
+            # split opcional do texto em p1..pN
+            if SHEETS_SPLIT_TEXT and 'texto_completo' in sub.columns:
+                parts_cols = []
 
-                    def split_row_text(s):
-                        chunks = _split_in_chunks(s)
-                        nonlocal parts_cols
-                        while len(parts_cols) < len(chunks):
-                            parts_cols.append(f"texto_completo_p{len(parts_cols)+1}")
-                        return chunks
+                def split_row_text(s):
+                    chunks = _split_in_chunks(s)
+                    nonlocal parts_cols
+                    while len(parts_cols) < len(chunks):
+                        parts_cols.append(f"texto_completo_p{len(parts_cols)+1}")
+                    return chunks
 
-                    all_chunks = sub['texto_completo'].apply(split_row_text)
-                    for idx, colname in enumerate(parts_cols):
-                        sub[colname] = all_chunks.apply(lambda lst, i=idx: lst[i] if i < len(lst) else "")
-                    sub.drop(columns=['texto_completo'], inplace=True, errors='ignore')
+                all_chunks = sub['texto_completo'].apply(split_row_text) if not sub.empty else pd.Series([])
+                for idx, colname in enumerate(parts_cols):
+                    sub[colname] = all_chunks.apply(lambda lst, i=idx: lst[i] if i < len(lst) else "") if not all_chunks.empty else []
+                sub.drop(columns=['texto_completo'], inplace=True, errors='ignore')
 
             # ordem de colunas
             base_cols = ['data_publicacao','titulo','fonte','url','palavras_por_cliente','resumo','data_coleta']
@@ -360,18 +385,50 @@ class ColetorNoticias:
             else:
                 cols = base_cols[:4] + ['palavras_por_cliente','resumo','texto_completo','data_coleta']
 
-            cols = [c for c in cols if c in sub.columns]
-            sub = sub[cols]
+            # garante somente colunas existentes e na ordem
+            cols = [c for c in cols if c in sub.columns] if not sub.empty else cols
+            sub = sub[cols] if not sub.empty else pd.DataFrame(columns=cols)
 
             # última barreira: garante que nada passa de 50k
             sub = _enforce_sheet_limits(sub, MAX_CELL_CHARS)
 
             ws = self._get_or_create_ws(sh, cliente)
-            if clear:
-                ws.clear()
 
-            set_with_dataframe(ws, sub, include_index=False, include_column_header=True, resize=True)
-            print(f"✓ Atualizada aba: {ws.title} ({len(sub)} linhas)")
+            # garante cabeçalho (só na primeira vez que a aba existe)
+            self._ensure_header(ws, cols)
+
+            # dedup contra o que JÁ está na planilha (por URL)
+            existing_df = self._read_ws_df(ws)
+            existing_urls = set()
+            url_col_name = None
+            for c in existing_df.columns:
+                if c.strip().lower() == "url":
+                    url_col_name = c
+                    break
+            if url_col_name:
+                existing_urls = set(existing_df[url_col_name].astype(str).tolist())
+
+            if not sub.empty and "url" in sub.columns:
+                sub = sub[~sub["url"].astype(str).isin(existing_urls)]
+
+            if sub.empty:
+                print(f"✓ Aba {ws.title}: nada novo para inserir.")
+                continue
+
+            # INSERE LINHAS no topo (a partir da linha 2)
+            ws.insert_rows([[]] * len(sub), row=2, value_input_option="RAW")
+
+            # escreve os dados a partir de A2, sem header
+            set_with_dataframe(
+                ws,
+                sub,
+                row=2,
+                col=1,
+                include_index=False,
+                include_column_header=False,
+                resize=False
+            )
+            print(f"✓ Inseridas {len(sub)} linhas no topo da aba: {ws.title}")
 
 # ======== Main ========
 if __name__ == "__main__":
@@ -396,6 +453,5 @@ if __name__ == "__main__":
 
     coletor.exportar_por_cliente_para_sheets(
         spreadsheet_id=SPREADSHEET_ID,
-        apenas_hoje=True,
-        clear=True
+        apenas_hoje=True
     )
