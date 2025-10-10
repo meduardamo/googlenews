@@ -1,9 +1,3 @@
-# Coleta notícias e grava direto no Google Sheets (uma aba por cliente)
-# - Sem CSV/XLSX.
-# - Cada aba mostra só as keywords do próprio cliente.
-# - Blindagem 50k chars por célula (truncamento) + opção de split do texto em p1..pN.
-# - INSERE novas linhas no topo (linha 2), sem sobrescrever histórico e sem duplicar por URL.
-
 import os, re, time, sys
 from datetime import datetime, timedelta, date
 
