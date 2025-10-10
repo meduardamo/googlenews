@@ -1,16 +1,17 @@
-name: GoogleNews → Sheets
+name: Coletor de Notícias
 
 on:
   schedule:
-    - cron: "0 10 * * *"  # 07h BRT
-    - cron: "0 12 * * *"  # 09h BRT
-    - cron: "0 15 * * *"  # 12h BRT
-    - cron: "0 17 * * *"  # 14h BRT
-    - cron: "0 20 * * *"  # 17h BRT
+    - cron: "0 10 * * *"   # 07:00 BRT
+    - cron: "0 12 * * *"   # 09:00 BRT
+    - cron: "0 15 * * *"   # 12:00 BRT
+    - cron: "0 17 * * *"   # 14:00 BRT
+    - cron: "0 20 * * *"   # 17:00 BRT
+    - cron: "0 2 * * *"    # 23:00 BRT
   workflow_dispatch: {}
 
 concurrency:
-  group: news-scraper
+  group: news-pipeline
   cancel-in-progress: false
 
 jobs:
@@ -19,7 +20,6 @@ jobs:
     env:
       TZ_OFFSET_HOURS: "-3"
       EXTRACT_BODY: "1"
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -47,7 +47,7 @@ jobs:
         run: |
           echo "$GCP_SERVICE_ACCOUNT_JSON" > credentials.json
 
-      - name: Run scraper
+      - name: Run scraper (GoogleNews → Sheets)
         env:
           GOOGLE_APPLICATION_CREDENTIALS: credentials.json
           SPREADSHEET_ID: ${{ secrets.PLANILHA }}
@@ -55,3 +55,16 @@ jobs:
           EXTRACT_BODY: ${{ env.EXTRACT_BODY }}
         run: |
           python scraper.py
+
+      - name: Run alignment
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: credentials.json
+          PLANILHA: ${{ secrets.PLANILHA }}
+          GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
+          # tuning opcional:
+          # GENAI_MODEL: "gemini-2.0-flash"
+          # ALIGN_BATCH_SIZE: "20"
+          # ALIGN_SLEEP_SEC: "0"
+          # ALIGN_READ_RANGE: "A1:Z5000"
+        run: |
+          python alinhamento.py
