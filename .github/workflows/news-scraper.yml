@@ -2,12 +2,14 @@ name: Coletor de Notícias
 
 on:
   schedule:
-    - cron: "0 10 * * *"   # 07:00 BRT
-    - cron: "0 12 * * *"   # 09:00 BRT
-    - cron: "0 15 * * *"   # 12:00 BRT
-    - cron: "0 17 * * *"   # 14:00 BRT
-    - cron: "0 20 * * *"   # 17:00 BRT
-    - cron: "0 2 * * *"    # 23:00 BRT
+    - cron: "0 8 * * *"   # 05:00 BRT
+    - cron: "0 10 * * *"  # 07:00 BRT
+    - cron: "0 12 * * *"  # 09:00 BRT
+    - cron: "0 15 * * *"  # 12:00 BRT
+    - cron: "0 17 * * *"  # 14:00 BRT
+    - cron: "0 20 * * *"  # 17:00 BRT
+    - cron: "0 2 * * *"   # 23:00 BRT
+    - cron: "0 4 * * *"   # 01:00 BRT
   workflow_dispatch: {}
 
 concurrency:
