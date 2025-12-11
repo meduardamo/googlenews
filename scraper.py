@@ -1,5 +1,4 @@
 # Coleta notícias e grava direto no Google Sheets (uma aba por cliente)
-# - Sem CSV/XLSX.
 # - Cada aba mostra só as keywords do próprio cliente.
 # - Blindagem 50k chars por célula (truncamento) + opção de split do texto em p1..pN.
 # - INSERE novas linhas no topo (linha 2), não sobrescreve e não duplica (chave: URL).
@@ -15,13 +14,13 @@ import gspread
 from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 
-# ======== Limites e flags ========
+# Limites e flags
 # Margem pra baixo do teto de 50k do Sheets
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 # Se 1/true → quebra 'texto_completo' em colunas p1..pN; senão só trunca.
 SHEETS_SPLIT_TEXT = os.getenv("SHEETS_SPLIT_TEXT", "0").strip() in ("1","true","True","yes","on")
 
-# ======== Helpers de limpeza/limite ========
+# Helpers de limpeza/limite
 def _clean_text(s: str) -> str:
     if s is None:
         return ""
@@ -190,7 +189,7 @@ class ColetorNoticias:
     def _eh_hoje(self, dt_obj):
         return bool(dt_obj) and dt_obj.date() == date.today()
 
-    # ==== matching ====
+    # matching
     def _hits_por_cliente(self, texto):
         hits = {}
         base = texto or ""
@@ -206,7 +205,7 @@ class ColetorNoticias:
     def _format_palavras_por_cliente(self, hits_dict):
         return "; ".join(f"{cli}=" + "|".join(kws) for cli, kws in hits_dict.items())
 
-    # ==== dedup interno ====
+    # dedup interno
     def noticia_existe(self, url):
         if not self.deduplicar:
             return False
@@ -219,7 +218,7 @@ class ColetorNoticias:
         self.df_noticias = pd.concat([self.df_noticias, pd.DataFrame([noticia])], ignore_index=True)
         return True
 
-    # ==== extração de corpo ====
+    # extração de corpo
     def extrair_texto_completo(self, url):
         try:
             art = Article(url, language='pt')
@@ -229,7 +228,7 @@ class ColetorNoticias:
         except Exception:
             return ""
 
-    # ==== coleta ====
+    # coleta
     def coletar_feeds(self, extrair_texto=False, apenas_hoje=True, pausa_seg=0.2):
         total_novas = 0
         print(f"\nIniciando coleta de {len(self.feeds)} fontes...\n" + "=" * 80)
@@ -282,7 +281,7 @@ class ColetorNoticias:
         print(f"Total novas: {total_novas} | Total na sessão: {len(self.df_noticias)}")
         return total_novas
 
-    # ==== Google Sheets ====
+    # Google Sheets
     def _gsheets_client(self):
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
         scopes = ["https://www.googleapis.com/auth/spreadsheets",
@@ -431,7 +430,7 @@ class ColetorNoticias:
             )
             print(f"✓ Inseridas {len(sub)} linhas no topo da aba: {ws.title}")
 
-# ======== Main ========
+# Main
 if __name__ == "__main__":
     SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
     if not SPREADSHEET_ID:
