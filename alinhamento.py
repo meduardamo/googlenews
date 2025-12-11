@@ -1,5 +1,5 @@
 # Alinhamento baseado em título+resumo+texto_completo (todas as abas)
-# - Usa Google Sheets (service account) e Gemini 2.5 Flash
+# - Usa Google Sheets e Gemini 2.5 Flash
 # - Lê todas as abas; para cada linha com material e sem "Alinhamento", escreve Alinhamento e Justificativa
 # - Robustez: backoff 429, valida JSON, tamanho máx. de célula
 
