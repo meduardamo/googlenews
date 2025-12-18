@@ -24,7 +24,7 @@ COL_LINK = os.getenv("COL_LINK", "Link").strip()
 COL_ESTADO = os.getenv("COL_ESTADO", "Estado").strip()
 
 APENAS_HOJE = os.getenv("APENAS_HOJE", "1").strip().lower() in ("1", "true", "yes", "on")
-MAX_PER_DOMAIN = int(os.getenv("MAX_PER_DOMAIN", "100"))
+MAX_PER_DOMAIN = int(os.getenv("MAX_PER_DOMAIN", "50"))
 PAUSA_ENTRE_DOMINIOS = float(os.getenv("PAUSA_ENTRE_DOMINIOS", "0.2"))
 
 WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1", "true", "yes", "on")
