@@ -18,7 +18,12 @@ from gspread.exceptions import APIError
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
 
-PLANILHA_ENV = os.getenv("PLANILHA_SUBNACIONAL", "").strip() or os.getenv("SPREADSHEET_ID", "").strip()
+SPREADSHEET_ID = (
+    os.getenv("PLANILHA_SUBNACIONAL", "").strip()
+    or os.getenv("SPREADSHEET_ID", "").strip()
+    or os.getenv("PLANILHA", "").strip()
+)
+
 ABA_ENTRADA = os.getenv("ABA_ENTRADA", "deduplicado").strip()
 COL_LINK = os.getenv("COL_LINK", "Link").strip()
 COL_ESTADO = os.getenv("COL_ESTADO", "Estado").strip()
@@ -32,19 +37,18 @@ PAUSA_BETWEEN_WS = float(os.getenv("PAUSA_BETWEEN_WS", "0.8"))
 BATCH_ROWS = int(os.getenv("BATCH_ROWS", "60"))
 
 MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "10"))
-MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "5"))
+MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "6"))
 
 WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1", "true", "yes", "on")
 ABA_CONSOLIDADO = os.getenv("ABA_CONSOLIDADO", "links_com_estado_monitoramento").strip()
-
 
 OUT_COLS = [
     "data_publicacao",
     "estado",
     "dominio",
+    "fonte",
     "titulo",
     "url",
-    "resumo",
     "data_coleta",
 ]
 
@@ -211,15 +215,11 @@ class ItemInput:
     dominio: str
 
 
-def ler_inputs(spreadsheet_id: str) -> list[ItemInput]:
+def ler_inputs(spreadsheet_id: str) -> list:
     gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
 
-    try:
-        ws_in = sh.worksheet(ABA_ENTRADA)
-    except gspread.WorksheetNotFound:
-        raise RuntimeError(f"Aba de entrada '{ABA_ENTRADA}' não existe.")
-
+    ws_in = sh.worksheet(ABA_ENTRADA)
     df_in = _read_ws_df(ws_in)
     if df_in.empty:
         raise ValueError(f"A aba '{ABA_ENTRADA}' não trouxe dados (header vazio ou sem linhas).")
@@ -252,7 +252,7 @@ def ler_inputs(spreadsheet_id: str) -> list[ItemInput]:
     return list(uniq.values())
 
 
-def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
+def coletar_google_news_por_dominios(inputs: list) -> pd.DataFrame:
     rows = []
     seen = set()
 
@@ -274,8 +274,7 @@ def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
         for dom in dominios:
             if (time.time() - start) > budget_s:
                 print("Atingiu orçamento de tempo do job, encerrando coleta para evitar falha no Actions.")
-                df = pd.DataFrame(rows, columns=OUT_COLS)
-                return df
+                return pd.DataFrame(rows, columns=OUT_COLS)
 
             rss = _google_news_rss_for_domain(dom)
             feed = feedparser.parse(rss)
@@ -286,10 +285,9 @@ def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
             for e in entries:
                 titulo = _truncate(e.get("title", "") or "")
                 url = (e.get("link", "") or "").strip()
-                resumo = _truncate(e.get("summary", "") or "")
-
                 if not url:
                     continue
+
                 if url in seen:
                     continue
                 seen.add(url)
@@ -303,9 +301,9 @@ def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
                         "data_publicacao": dt_pub.strftime("%Y-%m-%d %H:%M:%S") if dt_pub else "",
                         "estado": estado,
                         "dominio": dom,
+                        "fonte": "Google News (RSS)",
                         "titulo": titulo,
                         "url": _truncate(url),
-                        "resumo": resumo,
                         "data_coleta": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                 )
@@ -314,11 +312,9 @@ def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
                 time.sleep(PAUSA_ENTRE_DOMINIOS)
 
     df = pd.DataFrame(rows, columns=OUT_COLS)
-
-    for c in ["titulo", "resumo", "url", "estado", "dominio", "data_publicacao", "data_coleta"]:
+    for c in OUT_COLS:
         if c in df.columns:
             df[c] = df[c].astype(str).map(_truncate)
-
     return df
 
 
@@ -341,17 +337,15 @@ def _insert_rows_top_batch(ws, n_rows: int, insert_at_row: int = 2):
             }
         ]
     }
-
     _call_with_backoff(lambda: ws.spreadsheet.batch_update(body), what=f"insertDimension:{ws.title}")
 
 
-def _write_values(ws, start_row: int, start_col: int, values_2d: list[list[str]]):
+def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     end_row = start_row + len(values_2d) - 1
     end_col = start_col + (len(values_2d[0]) if values_2d else 0) - 1
     a1 = gspread.utils.rowcol_to_a1(start_row, start_col)
     b1 = gspread.utils.rowcol_to_a1(end_row, end_col)
     rng = f"{a1}:{b1}"
-
     _call_with_backoff(lambda: ws.update(rng, values_2d, value_input_option="RAW"), what=f"update_values:{ws.title}")
 
 
@@ -370,7 +364,6 @@ def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int = 2) -> i
         _insert_rows_top_batch(ws, len(values_2d), insert_at_row=insert_at_row)
         _write_values(ws, insert_at_row, 1, values_2d)
         total_rows += len(values_2d)
-
         time.sleep(1.2)
 
     return total_rows
@@ -385,7 +378,7 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
     sh = gc.open_by_key(spreadsheet_id)
 
     if WRITE_CONSOLIDADO:
-        ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=500, cols=30)
+        ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=800, cols=30)
         _ensure_header(ws_all, OUT_COLS)
 
         existing_urls_all = _dedup_existing_urls(ws_all)
@@ -402,7 +395,7 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
 
     for estado, sub in df.groupby("estado"):
         estado_tab = _normalize_estado(estado)
-        ws = _get_or_create_ws(sh, estado_tab, rows=200, cols=30)
+        ws = _get_or_create_ws(sh, estado_tab, rows=400, cols=30)
 
         _ensure_header(ws, OUT_COLS)
 
@@ -418,7 +411,7 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
             print(f"✓ {estado_tab}: inseridas {n} linhas no topo.")
         except APIError as ex:
             if _is_retryable_apierror(ex):
-                print(f"Quota estourou no meio da execução ao gravar {estado_tab}. Encerrando para tentar no próximo ciclo.")
+                print(f"Quota estourou ao gravar {estado_tab}. Parando aqui para tentar no próximo ciclo.")
                 return
             raise
 
@@ -437,11 +430,11 @@ def coletar_por_uf(spreadsheet_id: str):
 
 
 def main():
-    if not PLANILHA_ENV:
-        print("Defina PLANILHA_SUBNACIONAL (ou SPREADSHEET_ID) no ambiente.", file=sys.stderr)
+    if not SPREADSHEET_ID:
+        print("Defina PLANILHA_SUBNACIONAL (ou SPREADSHEET_ID/PLANILHA) no ambiente.", file=sys.stderr)
         sys.exit(1)
 
-    coletar_por_uf(PLANILHA_ENV)
+    coletar_por_uf(SPREADSHEET_ID)
 
 
 if __name__ == "__main__":
