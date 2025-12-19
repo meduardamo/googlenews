@@ -42,7 +42,6 @@ OUT_COLS = [
     "data_publicacao",
     "estado",
     "dominio",
-    "fonte",
     "titulo",
     "url",
     "resumo",
@@ -304,7 +303,6 @@ def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
                         "data_publicacao": dt_pub.strftime("%Y-%m-%d %H:%M:%S") if dt_pub else "",
                         "estado": estado,
                         "dominio": dom,
-                        "fonte": "Google News (RSS)",
                         "titulo": titulo,
                         "url": _truncate(url),
                         "resumo": resumo,
@@ -317,7 +315,7 @@ def coletar_google_news_por_dominios(inputs: list[ItemInput]) -> pd.DataFrame:
 
     df = pd.DataFrame(rows, columns=OUT_COLS)
 
-    for c in ["titulo", "resumo", "url", "estado", "dominio", "fonte", "data_publicacao", "data_coleta"]:
+    for c in ["titulo", "resumo", "url", "estado", "dominio", "data_publicacao", "data_coleta"]:
         if c in df.columns:
             df[c] = df[c].astype(str).map(_truncate)
 
