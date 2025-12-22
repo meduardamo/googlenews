@@ -51,6 +51,22 @@ OUT_COLS = [
     "data_coleta",
 ]
 
+# Layout padrão das abas de UF:
+# linha 1 = botão voltar
+# linha 2 = respiro
+# linha 3 = header
+# linha 4+ = dados
+TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
+
+ESTADOS_SET = {
+    "ACRE", "ALAGOAS", "AMAPÁ", "AMAZONAS", "BAHIA", "CEARÁ",
+    "DISTRITO FEDERAL", "ESPÍRITO SANTO", "GOIÁS", "MARANHÃO",
+    "MATO GROSSO", "MATO GROSSO DO SUL", "MINAS GERAIS", "PARÁ",
+    "PARAÍBA", "PARANÁ", "PERNAMBUCO", "PIAUÍ", "RIO DE JANEIRO",
+    "RIO GRANDE DO NORTE", "RIO GRANDE DO SUL", "RONDÔNIA",
+    "RORAIMA", "SANTA CATARINA", "SÃO PAULO", "SERGIPE", "TOCANTINS"
+}
+
 
 def _now_local():
     return datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)
@@ -119,7 +135,7 @@ def _eh_hoje(dt_obj: datetime) -> bool:
 
 
 def _chunk_list(lst, n):
-    return [lst[i : i + n] for i in range(0, len(lst), n)]
+    return [lst[i: i + n] for i in range(0, len(lst), n)]
 
 
 def _gsheets_client_from_env():
@@ -165,26 +181,70 @@ def _read_ws_values(ws):
     return _call_with_backoff(lambda: ws.get_all_values(), what=f"get_all_values:{ws.title}")
 
 
+def _layout_params_for_ws_title(title: str):
+    t = _normalize_estado(title)
+    if t in ESTADOS_SET:
+        header_row = 1 + TOP_RESERVED_ROWS_UF
+        insert_at_row = header_row + 1
+        return header_row, insert_at_row
+    # Entradas/Consolidado/Outras abas seguem layout simples:
+    return 1, 2
+
+
+def _find_header_row(values, expected_cols_lower: set, search_rows: int = 20):
+    if not values:
+        return None
+    upto = min(len(values), search_rows)
+    for i in range(upto):
+        row = values[i]
+        row_lower = {str(x).strip().lower() for x in row if str(x).strip()}
+        if expected_cols_lower.issubset(row_lower):
+            return i + 1  # 1-based
+    return None
+
+
 def _read_ws_df(ws):
     values = _read_ws_values(ws)
     if not values:
         return pd.DataFrame()
-    header = values[0]
-    if not header or not any(h.strip() for h in header):
+
+    expected = {c.strip().lower() for c in OUT_COLS}
+    header_row_guess, _ = _layout_params_for_ws_title(ws.title)
+    header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25) or header_row_guess
+
+    if len(values) < header_row:
         return pd.DataFrame()
-    rows = values[1:]
+
+    header = values[header_row - 1]
+    if not header or not any(str(h).strip() for h in header):
+        return pd.DataFrame()
+
+    rows = values[header_row:]
     width = len(header)
     norm_rows = [r + [""] * (width - len(r)) for r in rows]
-    return pd.DataFrame(norm_rows, columns=[h.strip() for h in header])
+    return pd.DataFrame(norm_rows, columns=[str(h).strip() for h in header])
 
 
 def _ensure_header(ws, columns):
     values = _read_ws_values(ws)
-    if not values or not values[0] or not any(v.strip() for v in values[0]):
-        rng = f"A1:{gspread.utils.rowcol_to_a1(1, len(columns))}"
-        _call_with_backoff(lambda: ws.update(rng, [columns], value_input_option="RAW"), what=f"write_header:{ws.title}")
-        return True
-    return False
+    expected = {c.strip().lower() for c in columns}
+
+    header_row_guess, _ = _layout_params_for_ws_title(ws.title)
+    header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25)
+
+    # Se já existe um header válido em algum lugar, não mexe
+    if header_row:
+        return False
+
+    # Se não achou, escreve no header_row_guess
+    a1 = gspread.utils.rowcol_to_a1(header_row_guess, 1)
+    b1 = gspread.utils.rowcol_to_a1(header_row_guess, len(columns))
+    rng = f"{a1}:{b1}"
+    _call_with_backoff(
+        lambda: ws.update(rng, [columns], value_input_option="RAW"),
+        what=f"write_header:{ws.title}"
+    )
+    return True
 
 
 def _get_or_create_ws(sh, title, rows=200, cols=30):
@@ -219,7 +279,7 @@ def ler_inputs(spreadsheet_id: str) -> list:
     sh = gc.open_by_key(spreadsheet_id)
 
     ws_in = sh.worksheet(ABA_ENTRADA)
-    df_in = _read_ws_df(ws_in)
+    df_in = _read_ws_df(ws_in)  # aba de entrada segue layout simples (header row 1)
     if df_in.empty:
         raise ValueError(f"A aba '{ABA_ENTRADA}' não trouxe dados (header vazio ou sem linhas).")
 
@@ -316,7 +376,7 @@ def coletar_google_news_por_dominios(inputs: list) -> pd.DataFrame:
     return df
 
 
-def _insert_rows_top_batch(ws, n_rows: int, insert_at_row: int = 2):
+def _insert_rows_top_batch(ws, n_rows: int, insert_at_row: int):
     if n_rows <= 0:
         return
 
@@ -347,7 +407,7 @@ def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     _call_with_backoff(lambda: ws.update(rng, values_2d, value_input_option="RAW"), what=f"update_values:{ws.title}")
 
 
-def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int = 2) -> int:
+def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
     if df_to_write.empty:
         return 0
 
@@ -375,6 +435,7 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
     gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
 
+    # Consolidado (layout simples: header row 1, dados a partir da 2)
     if WRITE_CONSOLIDADO:
         ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=800, cols=30)
         _ensure_header(ws_all, OUT_COLS)
@@ -382,8 +443,10 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         existing_urls_all = _dedup_existing_urls(ws_all)
         df_all = df[~df["url"].astype(str).isin(existing_urls_all)].copy()
 
+        header_row_all, insert_at_row_all = _layout_params_for_ws_title(ws_all.title)
+
         if not df_all.empty:
-            n = _write_df_in_top(ws_all, df_all[OUT_COLS], insert_at_row=2)
+            n = _write_df_in_top(ws_all, df_all[OUT_COLS], insert_at_row=insert_at_row_all)
             print(f"✓ Consolidado: inseridas {n} linhas em {ws_all.title}")
         else:
             print(f"✓ Consolidado: nada novo em {ws_all.title}")
@@ -391,6 +454,7 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         if PAUSA_BETWEEN_WS:
             time.sleep(PAUSA_BETWEEN_WS)
 
+    # Por UF (layout com TOP_RESERVED_ROWS_UF)
     for estado, sub in df.groupby("estado"):
         estado_tab = _normalize_estado(estado)
         ws = _get_or_create_ws(sh, estado_tab, rows=400, cols=30)
@@ -404,9 +468,11 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
             print(f"✓ {estado_tab}: nada novo.")
             continue
 
+        header_row, insert_at_row = _layout_params_for_ws_title(ws.title)
+
         try:
-            n = _write_df_in_top(ws, sub2[OUT_COLS], insert_at_row=2)
-            print(f"✓ {estado_tab}: inseridas {n} linhas no topo.")
+            n = _write_df_in_top(ws, sub2[OUT_COLS], insert_at_row=insert_at_row)
+            print(f"✓ {estado_tab}: inseridas {n} linhas no topo (a partir da linha {insert_at_row}).")
         except APIError as ex:
             if _is_retryable_apierror(ex):
                 print(f"Quota estourou ao gravar {estado_tab}. Parando aqui para tentar no próximo ciclo.")
