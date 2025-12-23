@@ -43,14 +43,20 @@ MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "7"))
 
 TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
 
+# Mantém data_publicacao/data_coleta como data-hora "de verdade" no Sheets (via USER_ENTERED),
+# e adiciona colunas só com a data para facilitar ordenação/agrupamento.
 OUT_COLS = [
     "data_publicacao",
+    "data_publicacao_dia",
     "estado",
     "dominio",
     "titulo",
     "url",
     "data_coleta",
+    "data_coleta_dia",
 ]
+
+DATE_COLS = {"data_publicacao", "data_publicacao_dia", "data_coleta", "data_coleta_dia"}
 
 ESTADOS_SET = {
     "ACRE", "ALAGOAS", "AMAPÁ", "AMAZONAS", "BAHIA", "CEARÁ",
@@ -98,6 +104,14 @@ def _truncate(s: str, limit: int = MAX_CELL_CHARS) -> str:
     if len(s) <= limit:
         return s
     return s[: max(0, limit - 10)] + " [..]"
+
+
+def _safe_user_entered_text(s: str) -> str:
+    s = "" if s is None else str(s)
+    s = _clean_text(s)
+    if s.lstrip().startswith("="):
+        return "'" + s
+    return s
 
 
 def _normalize_estado(estado: str) -> str:
@@ -172,7 +186,20 @@ def _entry_datetime(entry):
 
 
 def _eh_hoje(dt_obj: datetime) -> bool:
-    return bool(dt_obj) and dt_obj.date() == date.today()
+    return bool(dt_obj) and dt_obj.date() == _now_local().date()
+
+
+def _fmt_dt(dt_obj: datetime | None) -> str:
+    if not dt_obj:
+        return ""
+    # dd/mm/yyyy hh:mm:ss tende a virar datetime nativo em planilha pt-BR quando USER_ENTERED
+    return dt_obj.strftime("%d/%m/%Y %H:%M:%S")
+
+
+def _fmt_date(dt_obj: datetime | None) -> str:
+    if not dt_obj:
+        return ""
+    return dt_obj.strftime("%d/%m/%Y")
 
 
 def _chunk_list(lst, n):
@@ -222,6 +249,7 @@ def _read_ws_values(ws):
 
 
 def _layout_params_for_ws_title(title: str):
+    # fallback caso não ache header via varredura
     t = _normalize_estado(title)
     if t in ESTADOS_SET:
         header_row = 1 + TOP_RESERVED_ROWS_UF
@@ -240,6 +268,18 @@ def _find_header_row(values, expected_cols_lower: set, search_rows: int = 25):
         if expected_cols_lower.issubset(row_lower):
             return i + 1
     return None
+
+
+def _get_header_row_and_insert_at(ws, columns) -> tuple[int, int]:
+    values = _read_ws_values(ws)
+    expected = {c.strip().lower() for c in columns}
+
+    header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25)
+    if header_row:
+        return header_row, header_row + 1
+
+    header_row_guess, insert_at_guess = _layout_params_for_ws_title(ws.title)
+    return header_row_guess, insert_at_guess
 
 
 def _read_ws_df(ws):
@@ -333,7 +373,12 @@ def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     a1 = gspread.utils.rowcol_to_a1(start_row, start_col)
     b1 = gspread.utils.rowcol_to_a1(end_row, end_col)
     rng = f"{a1}:{b1}"
-    _call_with_backoff(lambda: ws.update(rng, values_2d, value_input_option="RAW"), what=f"update_values:{ws.title}")
+
+    # USER_ENTERED faz o Sheets interpretar dd/mm/yyyy e dd/mm/yyyy hh:mm:ss como data/data-hora
+    _call_with_backoff(
+        lambda: ws.update(rng, values_2d, value_input_option="USER_ENTERED"),
+        what=f"update_values:{ws.title}",
+    )
 
 
 def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
@@ -341,8 +386,12 @@ def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
         return 0
 
     df_to_write = df_to_write.copy()
+
     for col in df_to_write.columns:
-        df_to_write[col] = df_to_write[col].astype(str).map(_truncate)
+        if col in DATE_COLS:
+            df_to_write[col] = df_to_write[col].astype(str).map(_truncate)
+        else:
+            df_to_write[col] = df_to_write[col].astype(str).map(_safe_user_entered_text).map(_truncate)
 
     values = df_to_write.values.tolist()
     _insert_rows_once(ws, len(values), insert_at_row=insert_at_row)
@@ -474,14 +523,18 @@ def coletar_google_news(inputs: list) -> pd.DataFrame:
 
                 seen_urls.add(url)
 
+                dt_col = _now_local()
+
                 rows.append(
                     {
-                        "data_publicacao": dt_pub.strftime("%Y-%m-%d %H:%M:%S") if dt_pub else "",
+                        "data_publicacao": _fmt_dt(dt_pub),
+                        "data_publicacao_dia": _fmt_date(dt_pub),
                         "estado": estado,
                         "dominio": it.dominio,
                         "titulo": titulo,
                         "url": _truncate(url),
-                        "data_coleta": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                        "data_coleta": _fmt_dt(dt_col),
+                        "data_coleta_dia": _fmt_date(dt_col),
                     }
                 )
 
@@ -510,10 +563,12 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         existing_urls_all = _dedup_existing_urls(ws_all)
         df_all = df[~df["url"].astype(str).isin(existing_urls_all)].copy()
 
-        header_row_all, insert_at_row_all = _layout_params_for_ws_title(ws_all.title)
+        # Insere sempre logo abaixo do header que estiver na planilha (ex.: linha 3 -> insere na 4)
+        _, insert_at_row_all = _get_header_row_and_insert_at(ws_all, OUT_COLS)
+
         if not df_all.empty:
             n = _write_df_in_top(ws_all, df_all[OUT_COLS], insert_at_row=insert_at_row_all)
-            print(f"✓ Consolidado: inseridas {n} linhas em {ws_all.title}")
+            print(f"✓ Consolidado: inseridas {n} linhas em {ws_all.title} (a partir da linha {insert_at_row_all}).")
         else:
             print(f"✓ Consolidado: nada novo em {ws_all.title}")
 
@@ -533,7 +588,8 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
             print(f"✓ {estado_tab}: nada novo.")
             continue
 
-        _, insert_at_row = _layout_params_for_ws_title(ws.title)
+        # Insere sempre logo abaixo do header detectado (ex.: header na linha 3 -> entra na linha 4)
+        _, insert_at_row = _get_header_row_and_insert_at(ws, OUT_COLS)
 
         try:
             n = _write_df_in_top(ws, sub2[OUT_COLS], insert_at_row=insert_at_row)
