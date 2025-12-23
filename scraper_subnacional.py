@@ -35,8 +35,7 @@ PAUSA_ENTRE_FONTES = float(os.getenv("PAUSA_ENTRE_FONTES", os.getenv("PAUSA_ENTR
 PAUSA_BETWEEN_WS = float(os.getenv("PAUSA_BETWEEN_WS", "0.8"))
 
 BATCH_ROWS = int(os.getenv("BATCH_ROWS", "60"))
-MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "10"))
-MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "6"))
+MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "0"))  # 0 = todos
 
 WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1", "true", "yes", "on")
 ABA_CONSOLIDADO = os.getenv("ABA_CONSOLIDADO", "links_com_estado_monitoramento").strip()
@@ -46,7 +45,7 @@ OUT_COLS = ["data_publicacao", "estado", "dominio", "titulo", "url", "data_colet
 # Layout das abas UF: linha 1 = botão voltar; linha 2 = respiro; linha 3 = header; linha 4+ = dados
 TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
 
-INURL_TERMS = ("politica", "eleicoes", "eleicao", "poder")
+INURL_TERMS = ("politica", "eleicoes", "eleicao")
 
 ESTADOS_SET = {
     "ACRE", "ALAGOAS", "AMAPÁ", "AMAZONAS", "BAHIA", "CEARÁ",
@@ -58,7 +57,6 @@ ESTADOS_SET = {
 }
 
 
-# Utils
 def _now_local():
     return datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)
 
@@ -141,7 +139,8 @@ def _safe_add_query(url: str, extra: dict) -> str:
             if "=" in kv:
                 k, v = kv.split("=", 1)
                 existing[k] = v
-    existing.update(extra)
+    for k, v in extra.items():
+        existing[k] = str(v)
     new_q = urlencode(existing)
     return urlunparse((p.scheme, p.netloc, p.path, p.params, new_q, p.fragment))
 
@@ -152,30 +151,26 @@ def _candidate_feed_urls_from_section(section_url: str) -> list:
         return []
 
     low = u.lower()
-
-    # Se já aponta para algo "feed-like", prioriza isso
     if any(x in low for x in ("/feed", "feed=", "/rss", ".rss", ".xml", "atom")):
         return [u]
 
     u = _ensure_trailing_slash(u)
     base = u.rstrip("/")
 
-    candidates = []
+    candidates = [
+        u + "feed/",
+        base + "/feed",
+        _safe_add_query(u, {"feed": "rss2"}),
+        _safe_add_query(u, {"feed": "rss"}),
+        _safe_add_query(u, {"output": "rss"}),
+        _safe_add_query(u, {"format": "rss"}),
+        u + "rss/",
+        base + "/rss",
+        u + "rss.xml",
+        u + "index.xml",
+        u + "atom.xml",
+    ]
 
-    # WordPress / padrões comuns de seção
-    candidates.append(u + "feed/")
-    candidates.append(base + "/feed")
-    candidates.append(_safe_add_query(u, {"feed": "rss2"}))
-    candidates.append(_safe_add_query(u, {"feed": "rss"}))
-    candidates.append(_safe_add_query(u, {"output": "rss"}))
-    candidates.append(_safe_add_query(u, {"format": "rss"}))
-    candidates.append(u + "rss/")
-    candidates.append(base + "/rss")
-    candidates.append(u + "rss.xml")
-    candidates.append(u + "index.xml")
-    candidates.append(u + "atom.xml")
-
-    # dedup preservando ordem
     seen = set()
     out = []
     for c in candidates:
@@ -187,8 +182,7 @@ def _candidate_feed_urls_from_section(section_url: str) -> list:
 
 
 def _candidate_feed_urls_from_site_root(section_url: str) -> list:
-    site = _base_site_url(section_url)
-    site = _ensure_trailing_slash(site)
+    site = _ensure_trailing_slash(_base_site_url(section_url))
 
     candidates = [
         site + "feed/",
@@ -253,7 +247,6 @@ def _chunk_list(lst, n):
     return [lst[i: i + n] for i in range(0, len(lst), n)]
 
 
-# Google Sheets auth
 def _gsheets_client_from_env():
     sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "").strip()
     if not sa_json:
@@ -293,7 +286,6 @@ def _call_with_backoff(fn, *, what: str, max_tries: int = 8, base_sleep: float =
             time.sleep(sleep_s)
 
 
-# Sheet helpers
 def _read_ws_values(ws):
     return _call_with_backoff(lambda: ws.get_all_values(), what=f"get_all_values:{ws.title}")
 
@@ -355,7 +347,7 @@ def _ensure_header(ws, columns):
     b1 = gspread.utils.rowcol_to_a1(header_row_guess, len(columns))
     rng = f"{a1}:{b1}"
     _call_with_backoff(
-        lambda: ws.update(rng, [columns], value_input_option="RAW"),
+        lambda: ws.update(values=[columns], range_name=rng, value_input_option="RAW"),
         what=f"write_header:{ws.title}"
     )
     return True
@@ -404,12 +396,17 @@ def _insert_rows_top_batch(ws, n_rows: int, insert_at_row: int):
 
 
 def _write_values(ws, start_row: int, start_col: int, values_2d: list):
+    if not values_2d:
+        return
     end_row = start_row + len(values_2d) - 1
-    end_col = start_col + (len(values_2d[0]) if values_2d else 0) - 1
+    end_col = start_col + len(values_2d[0]) - 1
     a1 = gspread.utils.rowcol_to_a1(start_row, start_col)
     b1 = gspread.utils.rowcol_to_a1(end_row, end_col)
     rng = f"{a1}:{b1}"
-    _call_with_backoff(lambda: ws.update(rng, values_2d, value_input_option="RAW"), what=f"update_values:{ws.title}")
+    _call_with_backoff(
+        lambda: ws.update(values=values_2d, range_name=rng, value_input_option="RAW"),
+        what=f"update_values:{ws.title}"
+    )
 
 
 def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
@@ -432,7 +429,6 @@ def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
     return total_rows
 
 
-# Input model
 @dataclass
 class ItemInput:
     link: str
@@ -486,22 +482,17 @@ def ler_inputs(spreadsheet_id: str) -> list:
             )
         )
 
-    # dedup por UF + Link
     uniq = {}
     for it in out:
         uniq[(it.estado, it.link)] = it
-
     return list(uniq.values())
 
 
-# Feed collection
 def _parse_first_working_feed(urls: list) -> tuple:
-    # Retorna (entries, used_url) ou ([], "")
     for u in urls:
         try:
             feed = feedparser.parse(u)
             entries = feed.entries if hasattr(feed, "entries") else []
-            # "bozo" indica feed quebrado; mas alguns ainda vêm com entries
             if entries:
                 return entries, u
         except Exception:
@@ -518,21 +509,14 @@ def coletar_por_links(inputs: list) -> pd.DataFrame:
         by_state.setdefault(it.estado, []).append(it)
 
     estados = sorted(by_state.keys())
-    if MAX_ESTADOS_POR_RUN > 0:
+    if MAX_ESTADOS_POR_RUN and MAX_ESTADOS_POR_RUN > 0:
         estados = estados[:MAX_ESTADOS_POR_RUN]
-
-    start = time.time()
-    budget_s = max(60, MAX_MINUTES_BUDGET * 60)
 
     for estado in estados:
         sources = by_state.get(estado, [])
         print(f"\nEstado: {estado} | fontes: {len(sources)}")
 
         for src in sources:
-            if (time.time() - start) > budget_s:
-                print("Atingiu orçamento de tempo do job, encerrando coleta para evitar falha.")
-                return pd.DataFrame(rows, columns=OUT_COLS)
-
             # 1) feed da seção
             entries, used = _parse_first_working_feed(src.section_feed_candidates)
 
@@ -540,18 +524,14 @@ def coletar_por_links(inputs: list) -> pd.DataFrame:
             if not entries:
                 entries, used = _parse_first_working_feed(src.site_feed_candidates)
 
-            # 3) fallback GN com inurl(politica|eleicoes|eleicao)
-            feed_source = ""
+            # 3) fallback GN
             if entries:
-                feed_source = used
                 print(f"  feed OK -> {min(len(entries), MAX_PER_SOURCE)} entradas | {used}")
+                entries = entries[:MAX_PER_SOURCE]
             else:
                 feed = feedparser.parse(src.gn_rss)
                 entries = feed.entries[:MAX_PER_SOURCE] if feed.entries else []
-                feed_source = "GN"
                 print(f"  fallback GN -> {len(entries)} entradas | {src.link}")
-
-            entries = entries[:MAX_PER_SOURCE] if entries else []
 
             for e in entries:
                 titulo = _truncate(e.get("title", "") or "")
@@ -563,7 +543,6 @@ def coletar_por_links(inputs: list) -> pd.DataFrame:
                 seen_urls.add(url)
 
                 dt_pub = _entry_datetime(e)
-
                 if APENAS_HOJE and not _eh_hoje(dt_pub):
                     continue
 
@@ -596,7 +575,6 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
     gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
 
-    # Consolidado opcional
     if WRITE_CONSOLIDADO:
         ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=800, cols=30)
         _ensure_header(ws_all, OUT_COLS)
@@ -615,7 +593,6 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         if PAUSA_BETWEEN_WS:
             time.sleep(PAUSA_BETWEEN_WS)
 
-    # Por UF
     for estado, sub in df.groupby("estado"):
         estado_tab = _normalize_estado(estado)
         ws = _get_or_create_ws(sh, estado_tab, rows=400, cols=30)
