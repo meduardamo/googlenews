@@ -4,7 +4,7 @@ import sys
 import json
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 
 import feedparser
@@ -43,20 +43,9 @@ MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "7"))
 
 TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
 
-# Mantém data_publicacao/data_coleta como data-hora "de verdade" no Sheets (via USER_ENTERED),
-# e adiciona colunas só com a data para facilitar ordenação/agrupamento.
-OUT_COLS = [
-    "data_publicacao",
-    "data_publicacao_dia",
-    "estado",
-    "dominio",
-    "titulo",
-    "url",
-    "data_coleta",
-    "data_coleta_dia",
-]
-
-DATE_COLS = {"data_publicacao", "data_publicacao_dia", "data_coleta", "data_coleta_dia"}
+# Mantém só datetime (dd/mm/aaaa hh:mm:ss) e força o Sheets a entender como data-hora via USER_ENTERED + numberFormat
+OUT_COLS = ["data_publicacao", "estado", "dominio", "titulo", "url", "data_coleta"]
+DATE_COLS = {"data_publicacao", "data_coleta"}
 
 ESTADOS_SET = {
     "ACRE", "ALAGOAS", "AMAPÁ", "AMAZONAS", "BAHIA", "CEARÁ",
@@ -192,14 +181,7 @@ def _eh_hoje(dt_obj: datetime) -> bool:
 def _fmt_dt(dt_obj: datetime | None) -> str:
     if not dt_obj:
         return ""
-    # dd/mm/yyyy hh:mm:ss tende a virar datetime nativo em planilha pt-BR quando USER_ENTERED
     return dt_obj.strftime("%d/%m/%Y %H:%M:%S")
-
-
-def _fmt_date(dt_obj: datetime | None) -> str:
-    if not dt_obj:
-        return ""
-    return dt_obj.strftime("%d/%m/%Y")
 
 
 def _chunk_list(lst, n):
@@ -249,7 +231,6 @@ def _read_ws_values(ws):
 
 
 def _layout_params_for_ws_title(title: str):
-    # fallback caso não ache header via varredura
     t = _normalize_estado(title)
     if t in ESTADOS_SET:
         header_row = 1 + TOP_RESERVED_ROWS_UF
@@ -324,6 +305,53 @@ def _ensure_header(ws, columns):
     return True
 
 
+def _format_datetime_cols(ws, header_row: int):
+    values = _read_ws_values(ws)
+    if not values or len(values) < header_row:
+        return
+
+    header = values[header_row - 1]
+    header_norm = [str(x).strip().lower() for x in header]
+
+    col_indices_1based = []
+    for col_name in DATE_COLS:
+        try:
+            idx0 = header_norm.index(col_name.strip().lower())
+            col_indices_1based.append(idx0 + 1)
+        except ValueError:
+            pass
+
+    if not col_indices_1based:
+        return
+
+    requests = []
+    for col_idx in col_indices_1based:
+        requests.append(
+            {
+                "repeatCell": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "startRowIndex": header_row,        # abaixo do header
+                        "startColumnIndex": col_idx - 1,
+                        "endColumnIndex": col_idx,
+                    },
+                    "cell": {
+                        "userEnteredFormat": {
+                            "numberFormat": {
+                                "type": "DATE_TIME",
+                                "pattern": "dd/MM/yyyy hh:mm:ss",
+                            }
+                        }
+                    },
+                    "fields": "userEnteredFormat.numberFormat",
+                }
+            }
+        )
+
+    body = {"requests": requests}
+    _call_with_backoff(lambda: ws.spreadsheet.batch_update(body), what=f"format_datetime:{ws.title}")
+
+
 def _get_or_create_ws(sh, title, rows=200, cols=30):
     name = (title or "SEM_NOME").strip()[:31]
     try:
@@ -374,7 +402,6 @@ def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     b1 = gspread.utils.rowcol_to_a1(end_row, end_col)
     rng = f"{a1}:{b1}"
 
-    # USER_ENTERED faz o Sheets interpretar dd/mm/yyyy e dd/mm/yyyy hh:mm:ss como data/data-hora
     _call_with_backoff(
         lambda: ws.update(rng, values_2d, value_input_option="USER_ENTERED"),
         what=f"update_values:{ws.title}",
@@ -394,6 +421,8 @@ def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
             df_to_write[col] = df_to_write[col].astype(str).map(_safe_user_entered_text).map(_truncate)
 
     values = df_to_write.values.tolist()
+
+    # insert (no topo, linha logo abaixo do header) ao invés de append
     _insert_rows_once(ws, len(values), insert_at_row=insert_at_row)
 
     chunks = _chunk_list(values, BATCH_ROWS)
@@ -522,19 +551,16 @@ def coletar_google_news(inputs: list) -> pd.DataFrame:
                     continue
 
                 seen_urls.add(url)
-
                 dt_col = _now_local()
 
                 rows.append(
                     {
                         "data_publicacao": _fmt_dt(dt_pub),
-                        "data_publicacao_dia": _fmt_date(dt_pub),
                         "estado": estado,
                         "dominio": it.dominio,
                         "titulo": titulo,
                         "url": _truncate(url),
                         "data_coleta": _fmt_dt(dt_col),
-                        "data_coleta_dia": _fmt_date(dt_col),
                     }
                 )
 
@@ -560,11 +586,11 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=1200, cols=30)
         _ensure_header(ws_all, OUT_COLS)
 
+        header_row_all, insert_at_row_all = _get_header_row_and_insert_at(ws_all, OUT_COLS)
+        _format_datetime_cols(ws_all, header_row_all)
+
         existing_urls_all = _dedup_existing_urls(ws_all)
         df_all = df[~df["url"].astype(str).isin(existing_urls_all)].copy()
-
-        # Insere sempre logo abaixo do header que estiver na planilha (ex.: linha 3 -> insere na 4)
-        _, insert_at_row_all = _get_header_row_and_insert_at(ws_all, OUT_COLS)
 
         if not df_all.empty:
             n = _write_df_in_top(ws_all, df_all[OUT_COLS], insert_at_row=insert_at_row_all)
@@ -581,15 +607,15 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
 
         _ensure_header(ws, OUT_COLS)
 
+        header_row, insert_at_row = _get_header_row_and_insert_at(ws, OUT_COLS)
+        _format_datetime_cols(ws, header_row)
+
         existing_urls = _dedup_existing_urls(ws)
         sub2 = sub[~sub["url"].astype(str).isin(existing_urls)].copy()
 
         if sub2.empty:
             print(f"✓ {estado_tab}: nada novo.")
             continue
-
-        # Insere sempre logo abaixo do header detectado (ex.: header na linha 3 -> entra na linha 4)
-        _, insert_at_row = _get_header_row_and_insert_at(ws, OUT_COLS)
 
         try:
             n = _write_df_in_top(ws, sub2[OUT_COLS], insert_at_row=insert_at_row)
