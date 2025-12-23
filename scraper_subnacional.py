@@ -1,430 +1,570 @@
 import os
 import re
+import sys
+import json
 import time
-import unicodedata
+from dataclasses import dataclass
 from datetime import datetime, timedelta, date
-from urllib.parse import urlparse, quote_plus
+from urllib.parse import urlparse
 
-import requests
 import feedparser
 import pandas as pd
 
 import gspread
 from google.oauth2.service_account import Credentials
+from gspread.exceptions import APIError
 
 
-def _norm_spaces(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
+
+SPREADSHEET_ID = (
+    os.getenv("PLANILHA_SUBNACIONAL", "").strip()
+    or os.getenv("SPREADSHEET_ID", "").strip()
+    or os.getenv("PLANILHA", "").strip()
+)
+
+ABA_ENTRADA = os.getenv("ABA_ENTRADA", "deduplicado").strip()
+COL_LINK = os.getenv("COL_LINK", "Link").strip()
+COL_ESTADO = os.getenv("COL_ESTADO", "Estado").strip()
+
+APENAS_HOJE = os.getenv("APENAS_HOJE", "1").strip().lower() in ("1", "true", "yes", "on")
+MAX_PER_ITEM = int(os.getenv("MAX_PER_ITEM", "30"))
+
+PAUSA_ENTRE_ITENS = float(os.getenv("PAUSA_ENTRE_ITENS", "0.25"))
+PAUSA_ENTRE_ABAS = float(os.getenv("PAUSA_ENTRE_ABAS", "1.0"))
+
+BATCH_ROWS = int(os.getenv("BATCH_ROWS", "60"))
+WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1", "true", "yes", "on")
+ABA_CONSOLIDADO = os.getenv("ABA_CONSOLIDADO", "links_com_estado_monitoramento").strip()
+
+MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "0"))
+MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "7"))
+
+TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
+
+OUT_COLS = [
+    "data_publicacao",
+    "estado",
+    "dominio",
+    "titulo",
+    "url",
+    "data_coleta",
+]
+
+ESTADOS_SET = {
+    "ACRE", "ALAGOAS", "AMAPÁ", "AMAZONAS", "BAHIA", "CEARÁ",
+    "DISTRITO FEDERAL", "ESPÍRITO SANTO", "GOIÁS", "MARANHÃO",
+    "MATO GROSSO", "MATO GROSSO DO SUL", "MINAS GERAIS", "PARÁ",
+    "PARAÍBA", "PARANÁ", "PERNAMBUCO", "PIAUÍ", "RIO DE JANEIRO",
+    "RIO GRANDE DO NORTE", "RIO GRANDE DO SUL", "RONDÔNIA",
+    "RORAIMA", "SANTA CATARINA", "SÃO PAULO", "SERGIPE", "TOCANTINS"
+}
+
+POLITICA_PATTERNS = [
+    r"/politica\b",
+    r"/poder\b",
+    r"/eleicao\b",
+    r"/eleicoes\b",
+    r"/eleitoral\b",
+    r"/campanha\b",
+    r"/governo\b",
+    r"/congresso\b",
+    r"/assembleia\b",
+    r"/camara\b",
+    r"/senado\b",
+]
+POLITICA_RE = re.compile("|".join(POLITICA_PATTERNS), flags=re.I)
+
+TITLE_KEYWORDS_RE = re.compile(
+    r"\b(politic|poder|eleiç|eleic|govern|prefeit|câmara|camara|senad|deputad|vereador|assembleia)\b",
+    flags=re.I,
+)
 
 
-def _strip_accents(s: str) -> str:
-    s = s or ""
-    return "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
+def _now_local():
+    return datetime.now() + timedelta(hours=TZ_OFFSET_HOURS)
 
 
-def _now_str(tz_offset_hours: int) -> str:
-    return (datetime.utcnow() + timedelta(hours=tz_offset_hours)).strftime("%Y-%m-%d %H:%M:%S")
+def _clean_text(s: str) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    return "".join(ch for ch in s if (ch == "\n") or ((ord(ch) >= 32) and (ord(ch) != 127)))
 
 
-def _parse_dt(entry) -> datetime | None:
-    if getattr(entry, "published_parsed", None):
-        try:
-            return datetime(*entry.published_parsed[:6])
-        except Exception:
-            return None
-    if getattr(entry, "updated_parsed", None):
-        try:
-            return datetime(*entry.updated_parsed[:6])
-        except Exception:
-            return None
-    for k in ("published", "updated"):
-        if k in entry:
-            try:
-                dt = pd.to_datetime(entry.get(k), errors="coerce")
-                if pd.isna(dt):
-                    return None
-                return dt.to_pydatetime()
-            except Exception:
-                return None
-    return None
+def _truncate(s: str, limit: int = MAX_CELL_CHARS) -> str:
+    s = _clean_text(s)
+    if len(s) <= limit:
+        return s
+    return s[: max(0, limit - 10)] + " [..]"
 
 
-def _is_feed_url(u: str) -> bool:
-    u = (u or "").lower().strip()
-    return any(x in u for x in ("/feed", "format=feed", "rss", ".xml", "atom"))
+def _normalize_estado(estado: str) -> str:
+    return re.sub(r"\s+", " ", (estado or "").strip()).upper()
 
 
-def _has_path_beyond_root(u: str) -> bool:
+def _normalize_url(u: str) -> str:
+    if not u:
+        return ""
+    u = u.strip()
+    if not re.match(r"^https?://", u, flags=re.I):
+        u = "https://" + u
+    return u
+
+
+def _extract_domain(url: str) -> str:
+    if not url:
+        return ""
+    u = _normalize_url(url)
     try:
-        p = urlparse(u)
-        path = (p.path or "").strip("/")
-        return bool(path)
+        netloc = urlparse(u).netloc.lower()
+        netloc = netloc.split("@")[-1]
+        netloc = netloc.split(":")[0]
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
     except Exception:
-        return False
+        return ""
 
 
-def _google_news_rss_url(query: str) -> str:
-    q = quote_plus(query)
+def _domain_and_prefix_from_link(link: str):
+    u = _normalize_url(link)
+    p = urlparse(u)
+    domain = _extract_domain(u)
+
+    path = (p.path or "").strip()
+    if not path or path == "/":
+        return domain, None
+
+    prefix = f"{p.scheme}://{p.netloc}{path}"
+    prefix = prefix.rstrip("/") + "/"
+    return domain, prefix
+
+
+def _google_news_rss_for_query(q: str) -> str:
+    q = q.strip().replace(" ", "+")
     return f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
 
 
-def _domain_and_path(u: str) -> tuple[str, str]:
-    p = urlparse(u.strip())
-    domain = (p.netloc or "").lower()
-    path = (p.path or "").strip()
-    if not path.startswith("/"):
-        path = "/" + path if path else ""
-    return domain, path
+def _google_news_query(domain: str) -> str:
+    base = f"site:{domain}"
+    filtro = "(politica OR poder OR eleicao OR eleicoes OR eleitoral OR governo OR congresso)"
+    return f"{base} {filtro}"
 
 
-def _candidate_feeds_from_section_url(section_url: str) -> list[str]:
-    base = section_url.strip().rstrip("/")
-    candidates = [
-        base + "/feed/",
-        base + "/feed",
-        base + "/rss",
-        base + "/rss/",
-        base + "/rss.xml",
-        base + "?feed=rss",
-        base + "?format=feed&type=rss",
-        base + "?output=rss",
-        base + "?type=rss",
-        base + "/index.xml",
-        base + "/feed.xml",
-    ]
-    out, seen = [], set()
-    for c in candidates:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
-    return out
+def _entry_datetime(entry):
+    dt = None
+    if hasattr(entry, "published_parsed") and entry.published_parsed:
+        dt = datetime(*entry.published_parsed[:6])
+    elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
+        dt = datetime(*entry.updated_parsed[:6])
+    elif "published" in entry:
+        dt2 = pd.to_datetime(entry.get("published"), errors="coerce")
+        dt = None if pd.isna(dt2) else dt2.to_pydatetime()
+    elif "updated" in entry:
+        dt2 = pd.to_datetime(entry.get("updated"), errors="coerce")
+        dt = None if pd.isna(dt2) else dt2.to_pydatetime()
 
-
-def _looks_like_rss(text: str) -> bool:
-    t = (text or "").lower()
-    return ("<rss" in t) or ("<feed" in t) or ("atom" in t and "<feed" in t)
-
-
-def _try_fetch_rss(url: str, timeout: int = 15) -> str | None:
-    try:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code != 200:
-            return None
-        ct = (r.headers.get("content-type") or "").lower()
-        if ("xml" in ct) or ("rss" in ct) or ("atom" in ct) or _looks_like_rss(r.text[:5000]):
-            return url
+    if not dt:
         return None
-    except Exception:
-        return None
+    return dt + timedelta(hours=TZ_OFFSET_HOURS)
 
 
-def _ensure_worksheet(sh, title: str, columns: list[str], header_row: int) -> gspread.Worksheet:
-    safe_title = title[:31]
-    try:
-        ws = sh.worksheet(safe_title)
-    except gspread.WorksheetNotFound:
-        ws = sh.add_worksheet(title=safe_title, rows=200, cols=max(10, len(columns)))
-
-    values = ws.get_all_values()
-    need_min_rows = max(header_row, 3)
-    if ws.row_count < need_min_rows:
-        ws.resize(rows=need_min_rows)
-
-    # garante que o header exista exatamente na linha header_row (deixa as linhas acima livres pro "botão")
-    header_a1 = f"A{header_row}"
-    header_range_end_col = len(columns)
-
-    # checa se já tem header nessa linha
-    row_vals = []
-    try:
-        row_vals = ws.row_values(header_row)
-    except Exception:
-        row_vals = []
-
-    if not row_vals or not any((c or "").strip() for c in row_vals):
-        ws.resize(rows=max(ws.row_count, header_row + 1), cols=max(ws.col_count, header_range_end_col))
-        ws.update(header_a1, [columns])
-
-    return ws
+def _eh_hoje(dt_obj: datetime) -> bool:
+    return bool(dt_obj) and dt_obj.date() == date.today()
 
 
-def _get_existing_urls(ws: gspread.Worksheet, header_row: int) -> set[str]:
-    values = ws.get_all_values()
-    if not values or len(values) < header_row + 1:
-        return set()
-
-    header = [h.strip() for h in (values[header_row - 1] if len(values) >= header_row else [])]
-    try:
-        idx = [h.lower() for h in header].index("url")
-    except ValueError:
-        return set()
-
-    urls = set()
-    data_start = header_row  # 1-based row index; in list it's header_row
-    for row in values[data_start:]:
-        if idx < len(row):
-            u = (row[idx] or "").strip()
-            if u:
-                urls.add(u)
-    return urls
+def _chunk_list(lst, n):
+    return [lst[i: i + n] for i in range(0, len(lst), n)]
 
 
-def _insert_rows_for_top_write(sh, ws: gspread.Worksheet, n: int, header_row: int):
-    if n <= 0:
-        return
+def _gsheets_client_from_env():
+    sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    if not sa_json:
+        raise RuntimeError("Faltou o secret GCP_SERVICE_ACCOUNT_JSON no ambiente.")
+    info = json.loads(sa_json)
 
-    # queremos inserir as novas linhas imediatamente após o header
-    start_index_0b = header_row  # 0-based: header_row (1-based) vira header_row-1; inserir após header => startIndex = header_row
-    # exemplo: header_row=3 => header está em index 2; após header => startIndex=3
-    if ws.row_count < (header_row + 1):
-        ws.resize(rows=header_row + 1)
-
-    sheet_id = ws._properties["sheetId"]
-    req = {
-        "requests": [
-            {
-                "insertDimension": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "startIndex": start_index_0b,
-                        "endIndex": start_index_0b + n,
-                    },
-                    "inheritFromBefore": True,
-                }
-            }
-        ]
-    }
-    sh.batch_update(req)
-
-
-def _values_update(ws: gspread.Worksheet, start_row: int, start_col: int, values_2d: list[list[str]]):
-    if not values_2d:
-        return
-    n_rows = len(values_2d)
-    n_cols = max(len(r) for r in values_2d)
-
-    def col_letter(n: int) -> str:
-        s = ""
-        while n > 0:
-            n, r = divmod(n - 1, 26)
-            s = chr(65 + r) + s
-        return s
-
-    start_a1 = f"{col_letter(start_col)}{start_row}"
-    end_a1 = f"{col_letter(start_col + n_cols - 1)}{start_row + n_rows - 1}"
-    ws.update(f"{start_a1}:{end_a1}", values_2d, value_input_option="RAW")
-
-
-def coletar_por_uf(
-    spreadsheet_id: str,
-    aba_entrada: str = "deduplicado",
-    col_link: str = "Link",
-    col_estado: str = "Estado",
-    tz_offset_hours: int = -3,
-    apenas_hoje: bool = True,
-    dias: int = 2,
-    max_por_feed: int = 100,
-    pausa_seg: float = 0.15,
-    sleep_ufs: float = 0.5,
-    sleep_writes: float = 1.2,
-    header_row: int = 3,  # linha 1 e 2 livres pro botão/espacinho; header na 3
-):
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json").strip()
-    creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
-    gc = gspread.authorize(creds)
+    creds = Credentials.from_service_account_info(info, scopes=scopes)
+    return gspread.authorize(creds)
 
+
+def _is_retryable_apierror(ex: Exception) -> bool:
+    if not isinstance(ex, APIError):
+        return False
+    try:
+        code = ex.response.status_code
+        return code in (429, 500, 502, 503, 504)
+    except Exception:
+        return False
+
+
+def _call_with_backoff(fn, *, what: str, max_tries: int = 8, base_sleep: float = 2.0):
+    tries = 0
+    while True:
+        tries += 1
+        try:
+            return fn()
+        except Exception as ex:
+            if tries >= max_tries or not _is_retryable_apierror(ex):
+                raise
+            sleep_s = min(base_sleep * (2 ** (tries - 1)), 90.0)
+            print(f"Quota/instabilidade em '{what}' (tentativa {tries}/{max_tries}). Dormindo {sleep_s:.1f}s...")
+            time.sleep(sleep_s)
+
+
+def _read_ws_values(ws):
+    return _call_with_backoff(lambda: ws.get_all_values(), what=f"get_all_values:{ws.title}")
+
+
+def _layout_params_for_ws_title(title: str):
+    t = _normalize_estado(title)
+    if t in ESTADOS_SET:
+        header_row = 1 + TOP_RESERVED_ROWS_UF
+        insert_at_row = header_row + 1
+        return header_row, insert_at_row
+    return 1, 2
+
+
+def _find_header_row(values, expected_cols_lower: set, search_rows: int = 25):
+    if not values:
+        return None
+    upto = min(len(values), search_rows)
+    for i in range(upto):
+        row = values[i]
+        row_lower = {str(x).strip().lower() for x in row if str(x).strip()}
+        if expected_cols_lower.issubset(row_lower):
+            return i + 1
+    return None
+
+
+def _read_ws_df(ws):
+    values = _read_ws_values(ws)
+    if not values:
+        return pd.DataFrame()
+
+    expected = {c.strip().lower() for c in OUT_COLS}
+    header_row_guess, _ = _layout_params_for_ws_title(ws.title)
+    header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25) or header_row_guess
+
+    if len(values) < header_row:
+        return pd.DataFrame()
+
+    header = values[header_row - 1]
+    if not header or not any(str(h).strip() for h in header):
+        return pd.DataFrame()
+
+    rows = values[header_row:]
+    width = len(header)
+    norm_rows = [r + [""] * (width - len(r)) for r in rows]
+    return pd.DataFrame(norm_rows, columns=[str(h).strip() for h in header])
+
+
+def _ensure_header(ws, columns):
+    values = _read_ws_values(ws)
+    expected = {c.strip().lower() for c in columns}
+
+    header_row_guess, _ = _layout_params_for_ws_title(ws.title)
+    header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25)
+    if header_row:
+        return False
+
+    a1 = gspread.utils.rowcol_to_a1(header_row_guess, 1)
+    b1 = gspread.utils.rowcol_to_a1(header_row_guess, len(columns))
+    rng = f"{a1}:{b1}"
+
+    _call_with_backoff(
+        lambda: ws.update(rng, [columns], value_input_option="RAW"),
+        what=f"write_header:{ws.title}",
+    )
+    return True
+
+
+def _get_or_create_ws(sh, title, rows=200, cols=30):
+    name = (title or "SEM_NOME").strip()[:31]
+    try:
+        return sh.worksheet(name)
+    except gspread.WorksheetNotFound:
+        return _call_with_backoff(lambda: sh.add_worksheet(title=name, rows=rows, cols=cols), what=f"add_ws:{name}")
+
+
+def _dedup_existing_urls(ws) -> set:
+    df = _read_ws_df(ws)
+    if df.empty:
+        return set()
+
+    url_col = next((c for c in df.columns if c.strip().lower() == "url"), None)
+    if not url_col:
+        return set()
+
+    return set(df[url_col].astype(str).tolist())
+
+
+def _insert_rows_once(ws, n_rows: int, insert_at_row: int):
+    if n_rows <= 0:
+        return
+    body = {
+        "requests": [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": ws.id,
+                        "dimension": "ROWS",
+                        "startIndex": insert_at_row - 1,
+                        "endIndex": (insert_at_row - 1) + n_rows,
+                    },
+                    "inheritFromBefore": False,
+                }
+            }
+        ]
+    }
+    _call_with_backoff(lambda: ws.spreadsheet.batch_update(body), what=f"insertDimension:{ws.title}")
+
+
+def _write_values(ws, start_row: int, start_col: int, values_2d: list):
+    if not values_2d:
+        return
+    end_row = start_row + len(values_2d) - 1
+    end_col = start_col + len(values_2d[0]) - 1
+    a1 = gspread.utils.rowcol_to_a1(start_row, start_col)
+    b1 = gspread.utils.rowcol_to_a1(end_row, end_col)
+    rng = f"{a1}:{b1}"
+    _call_with_backoff(lambda: ws.update(rng, values_2d, value_input_option="RAW"), what=f"update_values:{ws.title}")
+
+
+def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
+    if df_to_write.empty:
+        return 0
+
+    df_to_write = df_to_write.copy()
+    for col in df_to_write.columns:
+        df_to_write[col] = df_to_write[col].astype(str).map(_truncate)
+
+    values = df_to_write.values.tolist()
+    _insert_rows_once(ws, len(values), insert_at_row=insert_at_row)
+
+    chunks = _chunk_list(values, BATCH_ROWS)
+    row_cursor = insert_at_row
+    total = 0
+
+    for block in chunks:
+        _write_values(ws, row_cursor, 1, block)
+        total += len(block)
+        row_cursor += len(block)
+        time.sleep(1.6)
+
+    return total
+
+
+def _passa_filtro_politica(url: str, titulo: str, prefix: str | None) -> bool:
+    url = (url or "").strip()
+    titulo = (titulo or "").strip()
+
+    if prefix:
+        if not url.startswith(prefix):
+            return False
+        return True
+
+    if POLITICA_RE.search(url):
+        return True
+
+    if TITLE_KEYWORDS_RE.search(titulo):
+        return True
+
+    return False
+
+
+@dataclass
+class ItemInput:
+    link: str
+    estado: str
+    dominio: str
+    prefix: str | None
+
+
+def ler_inputs(spreadsheet_id: str) -> list:
+    gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
 
-    ws_in = sh.worksheet(aba_entrada)
-    raw = ws_in.get_all_values()
-    if not raw or len(raw) < 2:
-        raise ValueError(f"A aba '{aba_entrada}' não trouxe dados (verifique header e conteúdo).")
+    ws_in = sh.worksheet(ABA_ENTRADA)
+    df_in = _read_ws_df(ws_in)
+    if df_in.empty:
+        raise ValueError(f"A aba '{ABA_ENTRADA}' não trouxe dados (header vazio ou sem linhas).")
 
-    header = [h.strip() for h in raw[0]]
-    rows = raw[1:]
-    df = pd.DataFrame(rows, columns=header)
+    cols_norm = {c.strip().lower(): c for c in df_in.columns}
+    if COL_LINK.strip().lower() not in cols_norm or COL_ESTADO.strip().lower() not in cols_norm:
+        raise ValueError(
+            f"Colunas esperadas não encontradas. Precisa de '{COL_LINK}' e '{COL_ESTADO}'. "
+            f"Colunas atuais: {list(df_in.columns)}"
+        )
 
-    cols_norm = {c.strip().lower(): c for c in df.columns}
-    if col_link.lower() not in cols_norm or col_estado.lower() not in cols_norm:
-        raise ValueError(f"Esperado '{col_link}' e '{col_estado}' na aba '{aba_entrada}'.")
+    c_link = cols_norm[COL_LINK.strip().lower()]
+    c_estado = cols_norm[COL_ESTADO.strip().lower()]
 
-    link_col = cols_norm[col_link.lower()]
-    estado_col = cols_norm[col_estado.lower()]
+    out = []
+    for _, row in df_in.iterrows():
+        link = str(row.get(c_link, "")).strip()
+        estado = str(row.get(c_estado, "")).strip()
+        if not link or not estado:
+            continue
 
-    df = df[[link_col, estado_col]].copy()
-    df[link_col] = df[link_col].astype(str).map(lambda x: x.strip())
-    df[estado_col] = df[estado_col].astype(str).map(lambda x: x.strip())
+        dom, prefix = _domain_and_prefix_from_link(link)
+        if not dom:
+            continue
 
-    df = df[(df[link_col] != "") & (df[estado_col] != "")]
+        out.append(ItemInput(link=link, estado=_normalize_estado(estado), dominio=dom, prefix=prefix))
+
+    uniq = {}
+    for it in out:
+        uniq[(it.estado, it.dominio, it.prefix or "")] = it
+
+    return list(uniq.values())
+
+
+def coletar_google_news(inputs: list) -> pd.DataFrame:
+    rows = []
+    seen_urls = set()
+
+    by_state = {}
+    for it in inputs:
+        by_state.setdefault(it.estado, []).append(it)
+
+    estados = sorted(by_state.keys())
+    if MAX_ESTADOS_POR_RUN and MAX_ESTADOS_POR_RUN > 0:
+        estados = estados[:MAX_ESTADOS_POR_RUN]
+
+    start = time.time()
+    budget_s = max(60, MAX_MINUTES_BUDGET * 60)
+
+    for estado in estados:
+        itens = by_state.get(estado, [])
+        print(f"\nEstado: {estado} | itens: {len(itens)}")
+
+        for it in itens:
+            if (time.time() - start) > budget_s:
+                print("Atingiu orçamento de tempo do job, encerrando para evitar falha no Actions.")
+                return pd.DataFrame(rows, columns=OUT_COLS)
+
+            q = _google_news_query(it.dominio)
+            rss = _google_news_rss_for_query(q)
+            feed = feedparser.parse(rss)
+
+            entries = feed.entries[:MAX_PER_ITEM] if feed.entries else []
+            print(f"  {it.dominio} -> {len(entries)} entradas (GN RSS)")
+
+            for e in entries:
+                titulo = _truncate(e.get("title", "") or "")
+                url = (e.get("link", "") or "").strip()
+                if not url:
+                    continue
+
+                if url in seen_urls:
+                    continue
+
+                dt_pub = _entry_datetime(e)
+                if APENAS_HOJE and not _eh_hoje(dt_pub):
+                    continue
+
+                if not _passa_filtro_politica(url, titulo, it.prefix):
+                    continue
+
+                seen_urls.add(url)
+
+                rows.append(
+                    {
+                        "data_publicacao": dt_pub.strftime("%Y-%m-%d %H:%M:%S") if dt_pub else "",
+                        "estado": estado,
+                        "dominio": it.dominio,
+                        "titulo": titulo,
+                        "url": _truncate(url),
+                        "data_coleta": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                )
+
+            if PAUSA_ENTRE_ITENS:
+                time.sleep(PAUSA_ENTRE_ITENS)
+
+    df = pd.DataFrame(rows, columns=OUT_COLS)
+    for c in OUT_COLS:
+        if c in df.columns:
+            df[c] = df[c].astype(str).map(_truncate)
+    return df
+
+
+def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
     if df.empty:
-        raise ValueError(f"A aba '{aba_entrada}' está sem linhas válidas em '{col_link}'/'{col_estado}'.")
+        print("Sem notícias para gravar.")
+        return
 
-    df = df.drop_duplicates(subset=[link_col, estado_col], keep="first")
+    gc = _gsheets_client_from_env()
+    sh = gc.open_by_key(spreadsheet_id)
 
-    out_cols = ["data_coleta", "estado", "fonte", "titulo", "url", "data_publicacao", "origem_link"]
+    if WRITE_CONSOLIDADO:
+        ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=1200, cols=30)
+        _ensure_header(ws_all, OUT_COLS)
 
-    hoje = date.today()
-    dt_min = datetime.utcnow() - timedelta(days=dias)
+        existing_urls_all = _dedup_existing_urls(ws_all)
+        df_all = df[~df["url"].astype(str).isin(existing_urls_all)].copy()
 
-    def ok_dt(dt_obj: datetime | None) -> bool:
-        if not dt_obj:
-            return True
-        local_dt = dt_obj + timedelta(hours=tz_offset_hours)
-        if apenas_hoje:
-            return local_dt.date() == hoje
-        return dt_obj >= dt_min
+        header_row_all, insert_at_row_all = _layout_params_for_ws_title(ws_all.title)
+        if not df_all.empty:
+            n = _write_df_in_top(ws_all, df_all[OUT_COLS], insert_at_row=insert_at_row_all)
+            print(f"✓ Consolidado: inseridas {n} linhas em {ws_all.title}")
+        else:
+            print(f"✓ Consolidado: nada novo em {ws_all.title}")
 
-    seen_global = set()
+        if PAUSA_ENTRE_ABAS:
+            time.sleep(PAUSA_ENTRE_ABAS)
 
-    for estado, g in df.groupby(estado_col, sort=True):
-        estado_tab = _norm_spaces(estado).upper()
+    for estado, sub in df.groupby("estado"):
+        estado_tab = _normalize_estado(estado)
+        ws = _get_or_create_ws(sh, estado_tab, rows=800, cols=30)
 
-        links = g[link_col].tolist()
-        links = [l for l in links if l and l.lower().startswith("http")]
-        if not links:
+        _ensure_header(ws, OUT_COLS)
+
+        existing_urls = _dedup_existing_urls(ws)
+        sub2 = sub[~sub["url"].astype(str).isin(existing_urls)].copy()
+
+        if sub2.empty:
+            print(f"✓ {estado_tab}: nada novo.")
             continue
 
-        print(f"\nEstado: {estado_tab} | links: {len(links)}")
-
-        noticias = []
-        for origem_link in links:
-            origem_link = origem_link.strip()
-            domain, path = _domain_and_path(origem_link)
-
-            feed_urls = []
-            if _is_feed_url(origem_link):
-                feed_urls = [origem_link]
-            else:
-                if _has_path_beyond_root(origem_link):
-                    candidates = _candidate_feeds_from_section_url(origem_link)
-                    for c in candidates:
-                        ok = _try_fetch_rss(c)
-                        if ok:
-                            feed_urls.append(ok)
-                            break
-
-                if not feed_urls:
-                    if domain:
-                        if path and path != "/":
-                            q = f"site:{domain}{path}"
-                        else:
-                            q = f"(politica OR poder OR eleicao OR eleições OR eleitoral) site:{domain}"
-                        feed_urls = [_google_news_rss_url(q)]
-
-            for fu in feed_urls:
-                try:
-                    fp = feedparser.parse(fu)
-                    entries = fp.entries[:max_por_feed]
-                    print(f"  {domain or origem_link} -> {len(entries)} entradas")
-
-                    for e in entries:
-                        title = _norm_spaces(e.get("title", ""))
-                        url = (e.get("link", "") or "").strip()
-                        if not url or not title:
-                            continue
-
-                        if not _has_path_beyond_root(origem_link):
-                            t_low = _strip_accents(title).lower()
-                            if not re.search(
-                                r"\b(politic|poder|elei(c|ç)ao|elei(c|ç)oes|governador|prefeito|candid|partid|camara|assembleia|senad|deputad)\b",
-                                t_low,
-                            ):
-                                continue
-
-                        if url in seen_global:
-                            continue
-
-                        dt_pub = _parse_dt(e)
-                        if dt_pub and not ok_dt(dt_pub):
-                            continue
-
-                        noticias.append(
-                            {
-                                "data_coleta": _now_str(tz_offset_hours),
-                                "estado": estado_tab,
-                                "fonte": domain or origem_link,
-                                "titulo": title,
-                                "url": url,
-                                "data_publicacao": (
-                                    (dt_pub + timedelta(hours=tz_offset_hours)).strftime("%Y-%m-%d %H:%M:%S")
-                                    if dt_pub
-                                    else ""
-                                ),
-                                "origem_link": origem_link,
-                            }
-                        )
-                        seen_global.add(url)
-
-                    if pausa_seg:
-                        time.sleep(pausa_seg)
-
-                except Exception as ex:
-                    print(f"  erro lendo feed: {fu} | {ex}")
-
-        if not noticias:
-            print(f"✓ {estado_tab}: nada novo (coleta vazia).")
-            time.sleep(sleep_ufs)
-            continue
-
-        ws = _ensure_worksheet(sh, estado_tab, out_cols, header_row=header_row)
-        existing_urls = _get_existing_urls(ws, header_row=header_row)
-
-        df_out = pd.DataFrame(noticias)
-        df_out = df_out.drop_duplicates(subset=["url"], keep="first")
-        df_out = df_out[~df_out["url"].astype(str).isin(existing_urls)]
-
-        if df_out.empty:
-            print(f"✓ {estado_tab}: nada novo para inserir (dedup).")
-            time.sleep(sleep_ufs)
-            continue
-
-        if "data_publicacao" in df_out.columns:
-            df_out = df_out.sort_values(by=["data_publicacao"], ascending=False, kind="stable")
-
-        values_2d = df_out[out_cols].astype(str).values.tolist()
+        _, insert_at_row = _layout_params_for_ws_title(ws.title)
 
         try:
-            # escreve sempre abaixo do header_row, deixando as linhas acima (1-2) pro botão/espacinho
-            _insert_rows_for_top_write(sh, ws, len(values_2d), header_row=header_row)
-            _values_update(ws, start_row=header_row + 1, start_col=1, values_2d=values_2d)
-            print(f"✓ {estado_tab}: inseridas {len(values_2d)} linhas no topo.")
-        except Exception as ex:
-            print(f"✗ {estado_tab}: erro ao escrever ({ex}).")
+            n = _write_df_in_top(ws, sub2[OUT_COLS], insert_at_row=insert_at_row)
+            print(f"✓ {estado_tab}: inseridas {n} linhas no topo (a partir da linha {insert_at_row}).")
+        except APIError as ex:
+            if _is_retryable_apierror(ex):
+                print(f"Quota estourou ao gravar {estado_tab}. Parando aqui para tentar no próximo ciclo.")
+                return
             raise
 
-        time.sleep(sleep_writes)
-        time.sleep(sleep_ufs)
+        if PAUSA_ENTRE_ABAS:
+            time.sleep(PAUSA_ENTRE_ABAS)
+
+
+def coletar_por_uf(spreadsheet_id: str):
+    inputs = ler_inputs(spreadsheet_id)
+    if not inputs:
+        print("Nenhum input válido encontrado (Link/Estado).")
+        return
+
+    df = coletar_google_news(inputs)
+    gravar_por_estado(spreadsheet_id, df)
+
+
+def main():
+    if not SPREADSHEET_ID:
+        print("Defina PLANILHA_SUBNACIONAL (ou SPREADSHEET_ID/PLANILHA) no ambiente.", file=sys.stderr)
+        sys.exit(1)
+
+    coletar_por_uf(SPREADSHEET_ID)
 
 
 if __name__ == "__main__":
-    SPREADSHEET_ID = os.getenv("PLANILHA_SUBNACIONAL", "").strip()
-    if not SPREADSHEET_ID:
-        raise SystemExit("Defina SPREADSHEET_ID no ambiente (key da planilha).")
-
-    ABA_ENTRADA = os.getenv("ABA_ENTRADA", "deduplicado").strip()
-    TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3").strip())
-    APENAS_HOJE = os.getenv("APENAS_HOJE", "1").strip().lower() in ("1", "true", "yes", "on")
-    DIAS = int(os.getenv("DIAS", "2").strip())
-    MAX_POR_FEED = int(os.getenv("MAX_POR_FEED", "100").strip())
-    PAUSA_SEG = float(os.getenv("PAUSA_SEG", "0.15").strip())
-    SLEEP_UFS = float(os.getenv("SLEEP_UFS", "0.5").strip())
-    SLEEP_WRITES = float(os.getenv("SLEEP_WRITES", "1.2").strip())
-    HEADER_ROW = int(os.getenv("HEADER_ROW", "3").strip())
-
-    coletar_por_uf(
-        spreadsheet_id=SPREADSHEET_ID,
-        aba_entrada=ABA_ENTRADA,
-        tz_offset_hours=TZ_OFFSET_HOURS,
-        apenas_hoje=APENAS_HOJE,
-        dias=DIAS,
-        max_por_feed=MAX_POR_FEED,
-        pausa_seg=PAUSA_SEG,
-        sleep_ufs=SLEEP_UFS,
-        sleep_writes=SLEEP_WRITES,
-        header_row=HEADER_ROW,
-    )
+    main()
