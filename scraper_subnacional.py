@@ -402,7 +402,7 @@ def coletar_por_uf(
 
 
 if __name__ == "__main__":
-    SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+    SPREADSHEET_ID = os.getenv("PLANILHA_SUBNACIONAL", "").strip()
     if not SPREADSHEET_ID:
         raise SystemExit("Defina SPREADSHEET_ID no ambiente (key da planilha).")
 
