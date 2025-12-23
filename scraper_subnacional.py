@@ -228,7 +228,7 @@ def _eh_hoje(dt_obj: datetime) -> bool:
 
 
 def _gsheets_client_from_env():
-    info_str = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
+    info_str = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "").strip()
     if info_str:
         info = json.loads(info_str)
     else:
