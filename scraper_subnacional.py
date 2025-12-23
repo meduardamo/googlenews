@@ -5,7 +5,8 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
+from urllib.request import Request, urlopen
 
 import feedparser
 import pandas as pd
@@ -17,6 +18,8 @@ from gspread.exceptions import APIError
 
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
+HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "8"))
+MAX_FEED_CANDIDATES = int(os.getenv("MAX_FEED_CANDIDATES", "10"))
 
 SPREADSHEET_ID = (
     os.getenv("PLANILHA_SUBNACIONAL", "").strip()
@@ -43,7 +46,6 @@ MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "7"))
 
 TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
 
-# Mantém só datetime (dd/mm/aaaa hh:mm:ss) e força o Sheets a entender como data-hora via USER_ENTERED + numberFormat
 OUT_COLS = ["data_publicacao", "estado", "dominio", "titulo", "url", "data_coleta"]
 DATE_COLS = {"data_publicacao", "data_coleta"}
 
@@ -143,6 +145,145 @@ def _domain_and_prefix_from_link(link: str):
     prefix = f"{p.scheme}://{p.netloc}{path}"
     prefix = prefix.rstrip("/") + "/"
     return domain, prefix
+
+
+def _site_root_from_url(u: str) -> str:
+    u = _normalize_url(u)
+    p = urlparse(u)
+    return f"{p.scheme}://{p.netloc}/"
+
+
+def _http_get_text(url: str, max_bytes: int = 250_000) -> str:
+    try:
+        req = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; SubnacionalRSS/1.0; +https://news.google.com/)",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        with urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+            data = resp.read(max_bytes)
+        return data.decode("utf-8", errors="ignore")
+    except Exception:
+        return ""
+
+
+def _discover_feed_links_from_html(page_url: str) -> list[str]:
+    html = _http_get_text(page_url)
+    if not html:
+        return []
+
+    # tenta pegar <link rel="alternate" type="application/rss+xml" href="...">
+    pattern = re.compile(
+        r"""<link[^>]+rel=["']alternate["'][^>]+type=["']application/(rss\+xml|atom\+xml)["'][^>]+href=["']([^"']+)["']""",
+        flags=re.I,
+    )
+    found = []
+    for m in pattern.finditer(html):
+        href = (m.group(2) or "").strip()
+        if not href:
+            continue
+        found.append(urljoin(page_url, href))
+
+    # fallback simples para casos onde type aparece mas rel não está bem formado
+    pattern2 = re.compile(
+        r"""href=["']([^"']+)["'][^>]+type=["']application/(rss\+xml|atom\+xml)["']""",
+        flags=re.I,
+    )
+    for m in pattern2.finditer(html):
+        href = (m.group(1) or "").strip()
+        if not href:
+            continue
+        found.append(urljoin(page_url, href))
+
+    uniq = []
+    seen = set()
+    for u in found:
+        u = _normalize_url(u)
+        if u and u not in seen:
+            uniq.append(u)
+            seen.add(u)
+    return uniq
+
+
+def _candidate_feed_urls(link: str, prefix: str | None) -> list[str]:
+    root = _site_root_from_url(link)
+    candidates = []
+
+    # candidatos típicos de site (WordPress, etc.)
+    candidates.extend([
+        urljoin(root, "feed/"),
+        urljoin(root, "feed"),
+        urljoin(root, "rss"),
+        urljoin(root, "rss/"),
+        urljoin(root, "rss.xml"),
+        urljoin(root, "feed.xml"),
+        urljoin(root, "atom.xml"),
+        urljoin(root, "?feed=rss2"),
+        urljoin(root, "?feed=rss"),
+    ])
+
+    # se você forneceu uma categoria/pasta (ex.: /politica/), tenta feed específico da seção
+    if prefix:
+        p = prefix.rstrip("/") + "/"
+        candidates.extend([
+            urljoin(p, "feed/"),
+            urljoin(p, "feed"),
+            urljoin(p, "rss"),
+            urljoin(p, "rss/"),
+            urljoin(p, "rss.xml"),
+            urljoin(p, "feed.xml"),
+            urljoin(p, "atom.xml"),
+            p + "?feed=rss2",
+            p + "?feed=rss",
+        ])
+
+    uniq = []
+    seen = set()
+    for u in candidates:
+        u = _normalize_url(u)
+        if u and u not in seen:
+            uniq.append(u)
+            seen.add(u)
+    return uniq
+
+
+def _parse_feed(feed_url: str):
+    try:
+        return feedparser.parse(feed_url)
+    except Exception:
+        return None
+
+
+def _try_site_feed_first(link: str, prefix: str | None) -> tuple[str | None, list]:
+    # 1) tenta candidatos comuns (mais rápido)
+    for u in _candidate_feed_urls(link, prefix)[:MAX_FEED_CANDIDATES]:
+        f = _parse_feed(u)
+        if f and getattr(f, "entries", None):
+            if len(f.entries) > 0:
+                return u, f.entries
+
+    # 2) tenta descobrir via HTML (mais robusto)
+    discovered = []
+    discovered.extend(_discover_feed_links_from_html(link))
+    if prefix:
+        discovered.extend(_discover_feed_links_from_html(prefix))
+
+    uniq = []
+    seen = set()
+    for u in discovered:
+        if u and u not in seen:
+            uniq.append(u)
+            seen.add(u)
+
+    for u in uniq[:MAX_FEED_CANDIDATES]:
+        f = _parse_feed(u)
+        if f and getattr(f, "entries", None):
+            if len(f.entries) > 0:
+                return u, f.entries
+
+    return None, []
 
 
 def _google_news_rss_for_query(q: str) -> str:
@@ -331,7 +472,7 @@ def _format_datetime_cols(ws, header_row: int):
                 "repeatCell": {
                     "range": {
                         "sheetId": ws.id,
-                        "startRowIndex": header_row,        # abaixo do header
+                        "startRowIndex": header_row,
                         "startColumnIndex": col_idx - 1,
                         "endColumnIndex": col_idx,
                     },
@@ -422,7 +563,6 @@ def _write_df_in_top(ws, df_to_write: pd.DataFrame, insert_at_row: int) -> int:
 
     values = df_to_write.values.tolist()
 
-    # insert (no topo, linha logo abaixo do header) ao invés de append
     _insert_rows_once(ws, len(values), insert_at_row=insert_at_row)
 
     chunks = _chunk_list(values, BATCH_ROWS)
@@ -443,9 +583,7 @@ def _passa_filtro_politica(url: str, titulo: str, prefix: str | None) -> bool:
     titulo = (titulo or "").strip()
 
     if prefix:
-        if not url.startswith(prefix):
-            return False
-        return True
+        return url.startswith(prefix)
 
     if POLITICA_RE.search(url):
         return True
@@ -503,7 +641,7 @@ def ler_inputs(spreadsheet_id: str) -> list:
     return list(uniq.values())
 
 
-def coletar_google_news(inputs: list) -> pd.DataFrame:
+def coletar_noticias(inputs: list) -> pd.DataFrame:
     rows = []
     seen_urls = set()
 
@@ -527,16 +665,32 @@ def coletar_google_news(inputs: list) -> pd.DataFrame:
                 print("Atingiu orçamento de tempo do job, encerrando para evitar falha no Actions.")
                 return pd.DataFrame(rows, columns=OUT_COLS)
 
-            q = _google_news_query(it.dominio)
-            rss = _google_news_rss_for_query(q)
-            feed = feedparser.parse(rss)
+            # 1) tenta feed do próprio site
+            feed_url, entries = _try_site_feed_first(it.link, it.prefix)
+            fonte = "site_rss" if entries else "google_news"
 
-            entries = feed.entries[:MAX_PER_ITEM] if feed.entries else []
-            print(f"  {it.dominio} -> {len(entries)} entradas (GN RSS)")
+            # 2) fallback para Google News RSS
+            if not entries:
+                q = _google_news_query(it.dominio)
+                rss = _google_news_rss_for_query(q)
+                feed = feedparser.parse(rss)
+                entries = feed.entries[:MAX_PER_ITEM] if feed.entries else []
+            else:
+                entries = entries[:MAX_PER_ITEM]
+
+            print(f"  {it.dominio} -> {len(entries)} entradas ({fonte}{': ' + feed_url if feed_url else ''})")
 
             for e in entries:
                 titulo = _truncate(e.get("title", "") or "")
+
                 url = (e.get("link", "") or "").strip()
+                if not url and "links" in e and e["links"]:
+                    url = (e["links"][0].get("href", "") or "").strip()
+
+                if feed_url:
+                    url = urljoin(feed_url, url)
+
+                url = _normalize_url(url)
                 if not url:
                     continue
 
@@ -636,7 +790,7 @@ def coletar_por_uf(spreadsheet_id: str):
         print("Nenhum input válido encontrado (Link/Estado).")
         return
 
-    df = coletar_google_news(inputs)
+    df = coletar_noticias(inputs)
     gravar_por_estado(spreadsheet_id, df)
 
 
