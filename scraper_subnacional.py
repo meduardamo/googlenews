@@ -3,18 +3,18 @@ import re
 import sys
 import json
 import time
-from datetime import datetime, timedelta, date
+import unicodedata
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from datetime import datetime, timedelta, date
+from urllib.parse import urlparse, quote_plus
 
 import feedparser
 import pandas as pd
+import requests
 
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import APIError
-
-# Fonte do código original: :contentReference[oaicite:0]{index=0}
 
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
@@ -37,8 +37,8 @@ PAUSA_BETWEEN_WS = float(os.getenv("PAUSA_BETWEEN_WS", "0.8"))
 
 BATCH_ROWS = int(os.getenv("BATCH_ROWS", "60"))
 
-MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "10"))
-MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "6"))
+MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "0"))
+MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "0"))
 
 WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1", "true", "yes", "on")
 ABA_CONSOLIDADO = os.getenv("ABA_CONSOLIDADO", "links_com_estado_monitoramento").strip()
@@ -52,12 +52,9 @@ OUT_COLS = [
     "data_coleta",
 ]
 
-# Layout padrão das abas de UF:
-# linha 1 = botão voltar (merge/estilo)
-# linha 2 = respiro
-# linha 3 = header
-# linha 4+ = dados
 TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
+
+DEFAULT_SECTION_KEYWORDS = ["politica", "poder", "eleicoes", "eleicao", "eleições", "eleição"]
 
 ESTADOS_SET = {
     "ACRE", "ALAGOAS", "AMAPÁ", "AMAZONAS", "BAHIA", "CEARÁ",
@@ -91,6 +88,14 @@ def _normalize_estado(estado: str) -> str:
     return re.sub(r"\s+", " ", (estado or "").strip()).upper()
 
 
+def _norm_no_accents(s: str) -> str:
+    s = (s or "").lower()
+    return "".join(
+        ch for ch in unicodedata.normalize("NFKD", s)
+        if not unicodedata.combining(ch)
+    )
+
+
 def _extract_domain(url: str) -> str:
     if not url:
         return ""
@@ -108,9 +113,43 @@ def _extract_domain(url: str) -> str:
         return ""
 
 
-def _google_news_rss_for_domain(domain: str) -> str:
-    q = f"site:{domain}"
-    return f"https://news.google.com/rss/search?q={q}&hl=pt-BR&gl=BR&ceid=BR:pt-419"
+def _extract_path(url: str) -> str:
+    if not url:
+        return ""
+    u = url.strip()
+    if not re.match(r"^https?://", u, flags=re.I):
+        u = "https://" + u
+    try:
+        return urlparse(u).path or ""
+    except Exception:
+        return ""
+
+
+def _keywords_from_path(path: str) -> list:
+    p = _norm_no_accents(path or "")
+    kws = set()
+
+    for k in DEFAULT_SECTION_KEYWORDS:
+        if _norm_no_accents(k) in p:
+            kws.add(_norm_no_accents(k))
+
+    if not kws:
+        return [_norm_no_accents(k) for k in DEFAULT_SECTION_KEYWORDS]
+
+    return sorted(kws)
+
+
+def _google_news_rss_for_domain(domain: str, section_keywords: list) -> str:
+    domain = (domain or "").strip().lower()
+    kws = [_norm_no_accents(k) for k in (section_keywords or []) if k]
+
+    if kws:
+        or_block = " OR ".join(kws)
+        q = f"site:{domain} ({or_block})"
+    else:
+        q = f"site:{domain}"
+
+    return "https://news.google.com/rss/search?q=" + quote_plus(q) + "&hl=pt-BR&gl=BR&ceid=BR:pt-419"
 
 
 def _entry_datetime(entry):
@@ -200,7 +239,7 @@ def _find_header_row(values, expected_cols_lower: set, *, start_row: int = 1, se
         row = values[i]
         row_lower = {str(x).strip().lower() for x in row if str(x).strip()}
         if expected_cols_lower.issubset(row_lower):
-            return i + 1  # 1-based
+            return i + 1
     return None
 
 
@@ -218,7 +257,6 @@ def _header_and_insert_row(ws, columns):
     if not header_row:
         header_row = header_row_guess
 
-    # garante que, em abas UF, nunca vamos inserir acima do layout
     if is_uf_tab and header_row < header_row_guess:
         header_row = header_row_guess
 
@@ -259,7 +297,6 @@ def _ensure_header(ws, columns):
     if header_row_found:
         return False
 
-    # escreve no header_row_guess (UF) ou linha 1 (outros)
     header_row_to_write = header_row_guess
     a1 = gspread.utils.rowcol_to_a1(header_row_to_write, 1)
     b1 = gspread.utils.rowcol_to_a1(header_row_to_write, len(columns))
@@ -297,6 +334,7 @@ class ItemInput:
     link: str
     estado: str
     dominio: str
+    section_keywords: list
 
 
 def ler_inputs(spreadsheet_id: str) -> list:
@@ -324,16 +362,68 @@ def ler_inputs(spreadsheet_id: str) -> list:
         estado = str(row.get(c_estado, "")).strip()
         if not link or not estado:
             continue
+
         dom = _extract_domain(link)
         if not dom:
             continue
-        out.append(ItemInput(link=link, estado=_normalize_estado(estado), dominio=dom))
+
+        path = _extract_path(link)
+        kws = _keywords_from_path(path)
+
+        out.append(
+            ItemInput(
+                link=link,
+                estado=_normalize_estado(estado),
+                dominio=dom,
+                section_keywords=kws
+            )
+        )
 
     uniq = {}
     for it in out:
-        uniq[(it.estado, it.dominio)] = it
+        key = (it.estado, it.dominio)
+        if key not in uniq:
+            uniq[key] = it
+        else:
+            merged = sorted(set(uniq[key].section_keywords) | set(it.section_keywords))
+            uniq[key].section_keywords = merged
 
     return list(uniq.values())
+
+
+GN_RESOLVE_CACHE = {}
+
+
+def _resolve_final_url(gn_url: str, timeout: int = 12) -> str:
+    if not gn_url:
+        return ""
+    if gn_url in GN_RESOLVE_CACHE:
+        return GN_RESOLVE_CACHE[gn_url]
+
+    headers = {"User-Agent": "Mozilla/5.0"}
+    final = gn_url
+
+    try:
+        r = requests.head(gn_url, allow_redirects=True, timeout=timeout, headers=headers)
+        if r.url:
+            final = r.url
+    except Exception:
+        try:
+            r = requests.get(gn_url, allow_redirects=True, timeout=timeout, headers=headers, stream=True)
+            if r.url:
+                final = r.url
+        except Exception:
+            final = gn_url
+
+    GN_RESOLVE_CACHE[gn_url] = final
+    return final
+
+
+def _matches_sections(url: str, section_keywords: list) -> bool:
+    if not section_keywords:
+        return True
+    u = _norm_no_accents(url)
+    return any(_norm_no_accents(k) in u for k in section_keywords)
 
 
 def coletar_google_news_por_dominios(inputs: list) -> pd.DataFrame:
@@ -342,39 +432,49 @@ def coletar_google_news_por_dominios(inputs: list) -> pd.DataFrame:
 
     by_state = {}
     for it in inputs:
-        by_state.setdefault(it.estado, []).append(it.dominio)
+        by_state.setdefault(it.estado, []).append(it)
 
     estados = sorted(by_state.keys())
-    if MAX_ESTADOS_POR_RUN > 0:
+    if MAX_ESTADOS_POR_RUN and MAX_ESTADOS_POR_RUN > 0:
         estados = estados[:MAX_ESTADOS_POR_RUN]
 
     start = time.time()
-    budget_s = max(60, MAX_MINUTES_BUDGET * 60)
+    budget_s = None if (MAX_MINUTES_BUDGET <= 0) else max(60, MAX_MINUTES_BUDGET * 60)
 
     for estado in estados:
-        dominios = sorted(set(by_state.get(estado, [])))
-        print(f"\nEstado: {estado} | domínios: {len(dominios)}")
+        items = by_state.get(estado, [])
+        items = sorted(items, key=lambda x: x.dominio)
 
-        for dom in dominios:
-            if (time.time() - start) > budget_s:
+        print(f"\nEstado: {estado} | domínios: {len(items)}")
+
+        for it in items:
+            if budget_s is not None and (time.time() - start) > budget_s:
                 print("Atingiu orçamento de tempo do job, encerrando coleta para evitar falha no Actions.")
                 return pd.DataFrame(rows, columns=OUT_COLS)
 
-            rss = _google_news_rss_for_domain(dom)
+            dom = it.dominio
+            kws = it.section_keywords or []
+
+            rss = _google_news_rss_for_domain(dom, kws)
             feed = feedparser.parse(rss)
 
             entries = feed.entries[:MAX_PER_DOMAIN] if feed.entries else []
-            print(f"  {dom} -> {len(entries)} entradas (GN RSS)")
+            print(f"  {dom} -> {len(entries)} entradas (GN RSS) | filtro: {','.join(kws) if kws else 'nenhum'}")
 
             for e in entries:
                 titulo = _truncate(e.get("title", "") or "")
-                url = (e.get("link", "") or "").strip()
-                if not url:
+                url_gn = (e.get("link", "") or "").strip()
+                if not url_gn:
                     continue
 
-                if url in seen:
+                url_final = _resolve_final_url(url_gn)
+
+                if not _matches_sections(url_final, kws):
                     continue
-                seen.add(url)
+
+                if url_final in seen:
+                    continue
+                seen.add(url_final)
 
                 dt_pub = _entry_datetime(e)
                 if APENAS_HOJE and not _eh_hoje(dt_pub):
@@ -386,7 +486,7 @@ def coletar_google_news_por_dominios(inputs: list) -> pd.DataFrame:
                         "estado": estado,
                         "dominio": dom,
                         "titulo": titulo,
-                        "url": _truncate(url),
+                        "url": _truncate(url_final),
                         "data_coleta": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
                     }
                 )
@@ -460,7 +560,6 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
     gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
 
-    # Consolidado
     if WRITE_CONSOLIDADO:
         ws_all = _get_or_create_ws(sh, ABA_CONSOLIDADO, rows=800, cols=30)
         _ensure_header(ws_all, OUT_COLS)
@@ -479,7 +578,6 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         if PAUSA_BETWEEN_WS:
             time.sleep(PAUSA_BETWEEN_WS)
 
-    # Por UF
     for estado, sub in df.groupby("estado"):
         estado_tab = _normalize_estado(estado)
         ws = _get_or_create_ws(sh, estado_tab, rows=400, cols=30)
