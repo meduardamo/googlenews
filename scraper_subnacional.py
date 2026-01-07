@@ -31,7 +31,7 @@ ABA_ENTRADA = os.getenv("ABA_ENTRADA", "deduplicado").strip()
 COL_LINK = os.getenv("COL_LINK", "Link").strip()
 COL_ESTADO = os.getenv("COL_ESTADO", "Estado").strip()
 
-APENAS_HOJE = os.getenv("APENAS_HOJE", "1").strip().lower() in ("1", "true", "yes", "on")
+APENAS_HOJE = os.getenv("APENAS_HOJE", "0").strip().lower() in ("1", "true", "yes", "on")
 MAX_PER_ITEM = int(os.getenv("MAX_PER_ITEM", "30"))
 
 PAUSA_ENTRE_ITENS = float(os.getenv("PAUSA_ENTRE_ITENS", "0.25"))
