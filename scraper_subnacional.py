@@ -17,7 +17,10 @@ from gspread.exceptions import APIError
 
 
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
-TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
+
+# Local: deixa 0 (hora local do seu PC). GitHub Actions: set TZ_OFFSET_HOURS=-3 no workflow.
+TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
+
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "3"))
 MAX_FEED_CANDIDATES = int(os.getenv("MAX_FEED_CANDIDATES", "10"))
 
@@ -25,7 +28,8 @@ SPREADSHEET_ID = (
     os.getenv("PLANILHA_SUBNACIONAL", "").strip()
     or os.getenv("SPREADSHEET_ID", "").strip()
     or os.getenv("PLANILHA", "").strip()
-)
+    or "16pn5Sp6dTwTOLbJPuic_gu2IPAN7E4zPLH2DorUn5Ek"
+).strip()
 
 ABA_ENTRADA = os.getenv("ABA_ENTRADA", "deduplicado").strip()
 COL_LINK = os.getenv("COL_LINK", "Link").strip()
@@ -42,8 +46,6 @@ WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1",
 ABA_CONSOLIDADO = os.getenv("ABA_CONSOLIDADO", "links_com_estado_monitoramento").strip()
 
 MAX_ESTADOS_POR_RUN = int(os.getenv("MAX_ESTADOS_POR_RUN", "0"))
-MAX_MINUTES_BUDGET = int(os.getenv("MAX_MINUTES_BUDGET", "7"))
-
 TOP_RESERVED_ROWS_UF = int(os.getenv("TOP_RESERVED_ROWS_UF", "2"))
 
 OUT_COLS = ["data_publicacao", "estado", "dominio", "titulo", "url", "data_coleta"]
@@ -326,6 +328,7 @@ def _entry_datetime(entry):
 
     if not dt:
         return None
+
     return dt + timedelta(hours=TZ_OFFSET_HOURS)
 
 
@@ -343,11 +346,39 @@ def _chunk_list(lst, n):
     return [lst[i: i + n] for i in range(0, len(lst), n)]
 
 
+def _maybe_write_credentials_from_env() -> str | None:
+    raw = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "").strip()
+    if not raw:
+        return None
+
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        obj = json.loads(raw.encode("utf-8").decode("unicode_escape"))
+
+    path = os.getenv("GCP_SERVICE_ACCOUNT_FILE", "credentials.json").strip() or "credentials.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f)
+
+    return path
+
+
 def _gsheets_client_from_env():
-    sa_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "").strip()
-    if not sa_json:
-        raise RuntimeError("Faltou o secret GCP_SERVICE_ACCOUNT_JSON no ambiente.")
-    info = json.loads(sa_json)
+    creds_file = os.getenv("GCP_SERVICE_ACCOUNT_FILE", "credentials.json").strip()
+
+    if not os.path.exists(creds_file):
+        maybe = _maybe_write_credentials_from_env()
+        if maybe:
+            creds_file = maybe
+
+    if not os.path.exists(creds_file):
+        raise RuntimeError(
+            f"Arquivo de credenciais não encontrado: {creds_file}. "
+            f"Defina GCP_SERVICE_ACCOUNT_FILE ou GCP_SERVICE_ACCOUNT_JSON."
+        )
+
+    with open(creds_file, "r", encoding="utf-8") as f:
+        info = json.load(f)
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -426,7 +457,6 @@ def _read_ws_df(ws, expected_cols=None):
     if expected_cols is None:
         expected_cols = OUT_COLS
     expected = {c.strip().lower() for c in expected_cols}
-
     header_row_guess, _ = _layout_params_for_ws_title(ws.title)
     header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25) or header_row_guess
 
@@ -457,7 +487,7 @@ def _ensure_header(ws, columns):
     rng = f"{a1}:{b1}"
 
     _call_with_backoff(
-        lambda: ws.update(rng, [columns], value_input_option="RAW"),
+        lambda: ws.update([columns], rng, value_input_option="RAW"),
         what=f"write_header:{ws.title}",
     )
     return True
@@ -495,7 +525,10 @@ def _format_datetime_cols(ws, header_row: int):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": {"type": "DATE_TIME", "pattern": "dd/MM/yyyy hh:mm:ss"}
+                            "numberFormat": {
+                                "type": "DATE_TIME",
+                                "pattern": "dd/MM/yyyy HH:mm:ss",
+                            }
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
@@ -510,7 +543,7 @@ def _format_datetime_cols(ws, header_row: int):
 def _get_or_create_ws(sh, title, rows=200, cols=30):
     name = (title or "SEM_NOME").strip()[:31]
     try:
-        return sh.worksheet(name)
+        return _call_with_backoff(lambda: sh.worksheet(name), what=f"get_ws:{name}")
     except gspread.WorksheetNotFound:
         return _call_with_backoff(lambda: sh.add_worksheet(title=name, rows=rows, cols=cols), what=f"add_ws:{name}")
 
@@ -551,7 +584,6 @@ def _insert_rows_once(ws, n_rows: int, insert_at_row: int):
 def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     if not values_2d:
         return
-
     end_row = start_row + len(values_2d) - 1
     end_col = start_col + len(values_2d[0]) - 1
     a1 = gspread.utils.rowcol_to_a1(start_row, start_col)
@@ -559,7 +591,7 @@ def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     rng = f"{a1}:{b1}"
 
     _call_with_backoff(
-        lambda: ws.update(rng, values_2d, value_input_option="USER_ENTERED"),
+        lambda: ws.update(values_2d, rng, value_input_option="USER_ENTERED"),
         what=f"update_values:{ws.title}",
     )
 
@@ -659,8 +691,6 @@ def ler_inputs(spreadsheet_id: str) -> list:
 def coletar_noticias(inputs: list) -> pd.DataFrame:
     rows = []
     seen_urls = set()
-    filtradas_count = 0
-    rejeitados = []
 
     by_state = {}
     for it in inputs:
@@ -670,18 +700,11 @@ def coletar_noticias(inputs: list) -> pd.DataFrame:
     if MAX_ESTADOS_POR_RUN and MAX_ESTADOS_POR_RUN > 0:
         estados = estados[:MAX_ESTADOS_POR_RUN]
 
-    start = time.time()
-    budget_s = max(60, MAX_MINUTES_BUDGET * 60)
-
     for estado in estados:
         itens = by_state.get(estado, [])
         print(f"\nEstado: {estado} | itens: {len(itens)}")
 
         for it in itens:
-            if (time.time() - start) > budget_s:
-                print("Atingiu orçamento de tempo do job, encerrando para evitar falha no Actions.")
-                return pd.DataFrame(rows, columns=OUT_COLS)
-
             feed_url, entries = _try_site_feed_first(it.link, it.prefix)
             fonte = "site_rss" if entries else "google_news"
 
@@ -717,8 +740,6 @@ def coletar_noticias(inputs: list) -> pd.DataFrame:
                     continue
 
                 if not _passa_filtro_politica(url, titulo, it.prefix):
-                    filtradas_count += 1
-                    rejeitados.append((it.dominio, titulo[:80]))
                     continue
 
                 seen_urls.add(url)
@@ -738,13 +759,6 @@ def coletar_noticias(inputs: list) -> pd.DataFrame:
             if PAUSA_ENTRE_ITENS:
                 time.sleep(PAUSA_ENTRE_ITENS)
 
-    if filtradas_count > 0:
-        print(f"\n  {filtradas_count} notícias foram rejeitadas pelo filtro político:")
-        for dominio, titulo in rejeitados[:10]:
-            print(f"   [{dominio}] {titulo}")
-        if len(rejeitados) > 10:
-            print(f"   ... e mais {len(rejeitados) - 10} outras")
-
     df = pd.DataFrame(rows, columns=OUT_COLS)
     for c in OUT_COLS:
         if c in df.columns:
@@ -757,18 +771,15 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
         print("Sem notícias para gravar.")
         return
 
-    # mantém só publicações dos últimos 30 dias
-    dt_pub = pd.to_datetime(df["data_publicacao"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
     df = df.copy()
-    df["data_publicacao"] = dt_pub
-    df = df[df["data_publicacao"] >= (_now_local() - timedelta(days=30))]
+    df["data_publicacao_dt"] = pd.to_datetime(df["data_publicacao"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    cutoff = _now_local() - timedelta(days=30)
+    df = df[df["data_publicacao_dt"].notna() & (df["data_publicacao_dt"] >= cutoff)].copy()
+    df.drop(columns=["data_publicacao_dt"], inplace=True)
 
     if df.empty:
         print("Sem notícias recentes (últimos 30 dias) para gravar.")
         return
-
-    # volta para string para escrever no Sheets
-    df["data_publicacao"] = df["data_publicacao"].map(lambda x: _fmt_dt(x) if pd.notna(x) else "")
 
     gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
