@@ -18,7 +18,7 @@ from gspread.exceptions import APIError
 
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
-HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "8"))
+HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "3"))
 MAX_FEED_CANDIDATES = int(os.getenv("MAX_FEED_CANDIDATES", "10"))
 
 SPREADSHEET_ID = (
@@ -32,10 +32,10 @@ COL_LINK = os.getenv("COL_LINK", "Link").strip()
 COL_ESTADO = os.getenv("COL_ESTADO", "Estado").strip()
 
 APENAS_HOJE = os.getenv("APENAS_HOJE", "0").strip().lower() in ("1", "true", "yes", "on")
-MAX_PER_ITEM = int(os.getenv("MAX_PER_ITEM", "30"))
+MAX_PER_ITEM = int(os.getenv("MAX_PER_ITEM", "5"))
 
-PAUSA_ENTRE_ITENS = float(os.getenv("PAUSA_ENTRE_ITENS", "0.25"))
-PAUSA_ENTRE_ABAS = float(os.getenv("PAUSA_ENTRE_ABAS", "1.0"))
+PAUSA_ENTRE_ITENS = float(os.getenv("PAUSA_ENTRE_ITENS", "0.1"))
+PAUSA_ENTRE_ABAS = float(os.getenv("PAUSA_ENTRE_ABAS", "0.5"))
 
 BATCH_ROWS = int(os.getenv("BATCH_ROWS", "60"))
 WRITE_CONSOLIDADO = os.getenv("WRITE_CONSOLIDADO", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -70,11 +70,31 @@ POLITICA_PATTERNS = [
     r"/assembleia\b",
     r"/camara\b",
     r"/senado\b",
+    r"/noticias/politica",
+    r"/categoria/politica",
+    r"/secao/politica",
+    r"/politica/",
+    r"/eleicoes/",
+    r"/governo/",
+    r"/congresso/",
+    r"/assembleia/",
+    r"/camara/",
+    r"/senado/",
+    r"/politica",
+    r"/eleicao",
+    r"/eleicoes",
+    r"/eleitoral",
+    r"/campanha",
+    r"/governo",
+    r"/congresso",
+    r"/assembleia",
+    r"/camara",
+    r"/senado",
 ]
 POLITICA_RE = re.compile("|".join(POLITICA_PATTERNS), flags=re.I)
 
 TITLE_KEYWORDS_RE = re.compile(
-    r"\b(politic|poder|eleiç|eleic|govern|prefeit|câmara|camara|senad|deputad|vereador|assembleia)\b",
+    r"\b(politic|política|poder|eleiç|eleic|govern|prefeit|câmara|camara|senad|deputad|vereador|assembleia|presidente|ministro|partido|oposi|legislat|execut|judiciar|constituic|democrac|eleitor|campanha|prefeito|governador)\b",
     flags=re.I,
 )
 
@@ -174,7 +194,6 @@ def _discover_feed_links_from_html(page_url: str) -> list[str]:
     if not html:
         return []
 
-    # tenta pegar <link rel="alternate" type="application/rss+xml" href="...">
     pattern = re.compile(
         r"""<link[^>]+rel=["']alternate["'][^>]+type=["']application/(rss\+xml|atom\+xml)["'][^>]+href=["']([^"']+)["']""",
         flags=re.I,
@@ -186,7 +205,6 @@ def _discover_feed_links_from_html(page_url: str) -> list[str]:
             continue
         found.append(urljoin(page_url, href))
 
-    # fallback simples para casos onde type aparece mas rel não está bem formado
     pattern2 = re.compile(
         r"""href=["']([^"']+)["'][^>]+type=["']application/(rss\+xml|atom\+xml)["']""",
         flags=re.I,
@@ -211,7 +229,6 @@ def _candidate_feed_urls(link: str, prefix: str | None) -> list[str]:
     root = _site_root_from_url(link)
     candidates = []
 
-    # candidatos típicos de site (WordPress, etc.)
     candidates.extend([
         urljoin(root, "feed/"),
         urljoin(root, "feed"),
@@ -224,7 +241,6 @@ def _candidate_feed_urls(link: str, prefix: str | None) -> list[str]:
         urljoin(root, "?feed=rss"),
     ])
 
-    # se você forneceu uma categoria/pasta (ex.: /politica/), tenta feed específico da seção
     if prefix:
         p = prefix.rstrip("/") + "/"
         candidates.extend([
@@ -257,14 +273,12 @@ def _parse_feed(feed_url: str):
 
 
 def _try_site_feed_first(link: str, prefix: str | None) -> tuple[str | None, list]:
-    # 1) tenta candidatos comuns (mais rápido)
     for u in _candidate_feed_urls(link, prefix)[:MAX_FEED_CANDIDATES]:
         f = _parse_feed(u)
         if f and getattr(f, "entries", None):
             if len(f.entries) > 0:
                 return u, f.entries
 
-    # 2) tenta descobrir via HTML (mais robusto)
     discovered = []
     discovered.extend(_discover_feed_links_from_html(link))
     if prefix:
@@ -404,12 +418,15 @@ def _get_header_row_and_insert_at(ws, columns) -> tuple[int, int]:
     return header_row_guess, insert_at_guess
 
 
-def _read_ws_df(ws):
+def _read_ws_df(ws, expected_cols=None):
     values = _read_ws_values(ws)
     if not values:
         return pd.DataFrame()
 
-    expected = {c.strip().lower() for c in OUT_COLS}
+    if expected_cols is None:
+        expected_cols = OUT_COLS
+    expected = {c.strip().lower() for c in expected_cols}
+
     header_row_guess, _ = _layout_params_for_ws_title(ws.title)
     header_row = _find_header_row(values, expected_cols_lower=expected, search_rows=25) or header_row_guess
 
@@ -478,10 +495,7 @@ def _format_datetime_cols(ws, header_row: int):
                     },
                     "cell": {
                         "userEnteredFormat": {
-                            "numberFormat": {
-                                "type": "DATE_TIME",
-                                "pattern": "dd/MM/yyyy hh:mm:ss",
-                            }
+                            "numberFormat": {"type": "DATE_TIME", "pattern": "dd/MM/yyyy hh:mm:ss"}
                         }
                     },
                     "fields": "userEnteredFormat.numberFormat",
@@ -537,6 +551,7 @@ def _insert_rows_once(ws, n_rows: int, insert_at_row: int):
 def _write_values(ws, start_row: int, start_col: int, values_2d: list):
     if not values_2d:
         return
+
     end_row = start_row + len(values_2d) - 1
     end_col = start_col + len(values_2d[0]) - 1
     a1 = gspread.utils.rowcol_to_a1(start_row, start_col)
@@ -582,8 +597,8 @@ def _passa_filtro_politica(url: str, titulo: str, prefix: str | None) -> bool:
     url = (url or "").strip()
     titulo = (titulo or "").strip()
 
-    if prefix:
-        return url.startswith(prefix)
+    if prefix and url.startswith(prefix):
+        return True
 
     if POLITICA_RE.search(url):
         return True
@@ -607,7 +622,7 @@ def ler_inputs(spreadsheet_id: str) -> list:
     sh = gc.open_by_key(spreadsheet_id)
 
     ws_in = sh.worksheet(ABA_ENTRADA)
-    df_in = _read_ws_df(ws_in)
+    df_in = _read_ws_df(ws_in, expected_cols=[COL_LINK, COL_ESTADO])
     if df_in.empty:
         raise ValueError(f"A aba '{ABA_ENTRADA}' não trouxe dados (header vazio ou sem linhas).")
 
@@ -644,6 +659,8 @@ def ler_inputs(spreadsheet_id: str) -> list:
 def coletar_noticias(inputs: list) -> pd.DataFrame:
     rows = []
     seen_urls = set()
+    filtradas_count = 0
+    rejeitados = []
 
     by_state = {}
     for it in inputs:
@@ -665,11 +682,9 @@ def coletar_noticias(inputs: list) -> pd.DataFrame:
                 print("Atingiu orçamento de tempo do job, encerrando para evitar falha no Actions.")
                 return pd.DataFrame(rows, columns=OUT_COLS)
 
-            # 1) tenta feed do próprio site
             feed_url, entries = _try_site_feed_first(it.link, it.prefix)
             fonte = "site_rss" if entries else "google_news"
 
-            # 2) fallback para Google News RSS
             if not entries:
                 q = _google_news_query(it.dominio)
                 rss = _google_news_rss_for_query(q)
@@ -702,6 +717,8 @@ def coletar_noticias(inputs: list) -> pd.DataFrame:
                     continue
 
                 if not _passa_filtro_politica(url, titulo, it.prefix):
+                    filtradas_count += 1
+                    rejeitados.append((it.dominio, titulo[:80]))
                     continue
 
                 seen_urls.add(url)
@@ -721,6 +738,13 @@ def coletar_noticias(inputs: list) -> pd.DataFrame:
             if PAUSA_ENTRE_ITENS:
                 time.sleep(PAUSA_ENTRE_ITENS)
 
+    if filtradas_count > 0:
+        print(f"\n  {filtradas_count} notícias foram rejeitadas pelo filtro político:")
+        for dominio, titulo in rejeitados[:10]:
+            print(f"   [{dominio}] {titulo}")
+        if len(rejeitados) > 10:
+            print(f"   ... e mais {len(rejeitados) - 10} outras")
+
     df = pd.DataFrame(rows, columns=OUT_COLS)
     for c in OUT_COLS:
         if c in df.columns:
@@ -732,6 +756,19 @@ def gravar_por_estado(spreadsheet_id: str, df: pd.DataFrame):
     if df.empty:
         print("Sem notícias para gravar.")
         return
+
+    # mantém só publicações dos últimos 30 dias
+    dt_pub = pd.to_datetime(df["data_publicacao"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    df = df.copy()
+    df["data_publicacao"] = dt_pub
+    df = df[df["data_publicacao"] >= (_now_local() - timedelta(days=30))]
+
+    if df.empty:
+        print("Sem notícias recentes (últimos 30 dias) para gravar.")
+        return
+
+    # volta para string para escrever no Sheets
+    df["data_publicacao"] = df["data_publicacao"].map(lambda x: _fmt_dt(x) if pd.notna(x) else "")
 
     gc = _gsheets_client_from_env()
     sh = gc.open_by_key(spreadsheet_id)
