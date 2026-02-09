@@ -29,9 +29,9 @@ SKIP_TITLES = [s.strip() for s in os.getenv("ALIGN_SKIP_TABS", "").split(",") if
 
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 
-DELETE_NAO_ALINHA = os.getenv("DELETE_NAO_ALINHA", "0").strip() in ("1","true","True","yes","on")
+# Liga a remoção automática (tira Não Alinha e Não se aplica)
+DELETE_INVALID = os.getenv("DELETE_INVALID", "1").strip() in ("1","true","True","yes","on")
 DELETE_CHUNK_SIZE = int(os.getenv("DELETE_CHUNK_SIZE", "80"))
-DELETE_NAO_SE_APLICA = os.getenv("DELETE_NAO_SE_APLICA", "0").strip() in ("1","true","True","yes","on")
 
 ORG_MAP = {
     "IU": ("Instituto Unibanco (IU)",
@@ -66,7 +66,6 @@ ORG_MAP = {
               "A Umane é uma organização da sociedade civil, isenta e sem fins lucrativos, que atua para fomentar melhorias sistêmicas na saúde pública no Brasil.")
 }
 
-# PROMPT atualizado (como você pediu)
 PROMPT = Template(r"""
 Você é analista de políticas públicas e faz triagem de atos do DOU, matérias legislativas e notícias para um(a) cliente.
 
@@ -128,7 +127,7 @@ def _truncate_cell(s: str, limit: int = MAX_CELL_CHARS) -> str:
     s = str(s) if s is not None else ""
     return s if len(s) <= limit else s[: max(0, limit - 10)] + " [..]"
 
-def build_material(row, tit_col, res_col, body_col) -> str:
+def build_content(row, tit_col, res_col, body_col) -> str:
     t = strip_html(row.get(tit_col, ""))
     r = strip_html(row.get(res_col, ""))
     b = strip_html(row.get(body_col, ""))
@@ -188,7 +187,7 @@ def call_gemini(prompt_text: str) -> dict:
             delay = min(delay * 2, 20)
     return {"alinhamento": "Parcial", "justificativa": "Falha após tentativas; revisar."}
 
-def classify_material(conteudo: str, descricao_cliente: str) -> dict:
+def classify_content(conteudo: str, descricao_cliente: str) -> dict:
     if not conteudo:
         return {
             "alinhamento": "Parcial",
@@ -221,13 +220,13 @@ def _delete_rows_in_chunks(ws, rows_1based, chunk_size=80):
         time.sleep(0.2)
     return deleted
 
-def _is_delete_target(v, delete_nao_alinha=True, delete_nao_se_aplica=False):
+def _is_invalid_alignment(v):
     s = str(v).strip().lower()
-    if delete_nao_alinha and s in ("não alinha", "nao alinha", "nãoalinha", "naoalinha"):
-        return True
-    if delete_nao_se_aplica and s in ("não se aplica", "nao se aplica", "não seaplica", "nao seaplica"):
-        return True
-    return False
+    return s in (
+        "não alinha", "nao alinha", "nãoalinha", "naoalinha",
+        "não se aplica", "nao se aplica", "não seaplica", "nao seaplica",
+        "nao-se-aplica", "não-se-aplica"
+    )
 
 def process_sheet(ws):
     title = ws.title.strip()
@@ -272,8 +271,8 @@ def process_sheet(ws):
         for start in range(0, len(to_process), BATCH_SIZE):
             batch_idx = to_process[start:start + BATCH_SIZE]
             for i in batch_idx:
-                conteudo = build_material(df.loc[i], tit_col, res_col, body_col)
-                res = classify_material(conteudo, desc_cli)
+                conteudo = build_content(df.loc[i], tit_col, res_col, body_col)
+                res = classify_content(conteudo, desc_cli)
                 df.at[i, OUT_ALINH_COL] = _truncate_cell(res["alinhamento"], MAX_CELL_CHARS)
                 df.at[i, OUT_JUST_COL]  = _truncate_cell(res["justificativa"], MAX_CELL_CHARS)
                 if SLEEP_SEC:
@@ -288,10 +287,10 @@ def process_sheet(ws):
             )
             print(f"[{title}] 💾 salvo linhas até {max(batch_idx) + 2}")
 
-    if not (DELETE_NAO_ALINHA or DELETE_NAO_SE_APLICA):
+    if not DELETE_INVALID:
         return
 
-    print(f"[{title}] 🧹 removendo linhas (Não Alinha / Não se aplica)...")
+    print(f"[{title}] 🧹 removendo linhas com 'Não Alinha' e 'Não se aplica'...")
     start_row = _range_start_row(READ_RANGE)
     data_start_row = start_row + 1
 
@@ -300,14 +299,7 @@ def process_sheet(ws):
         print(f"[{title}] não existe coluna '{OUT_ALINH_COL}' — nada a remover.")
         return
 
-    idx_to_drop = [
-        i for i in range(len(df))
-        if _is_delete_target(
-            df.at[i, col_alinh],
-            delete_nao_alinha=DELETE_NAO_ALINHA,
-            delete_nao_se_aplica=DELETE_NAO_SE_APLICA
-        )
-    ]
+    idx_to_drop = [i for i in range(len(df)) if _is_invalid_alignment(df.at[i, col_alinh])]
     if not idx_to_drop:
         print(f"[{title}] nada para remover.")
         return
