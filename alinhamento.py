@@ -33,7 +33,7 @@ MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 DELETE_INVALID = os.getenv("DELETE_INVALID", "1").strip() in ("1","true","True","yes","on")
 DELETE_CHUNK_SIZE = int(os.getenv("DELETE_CHUNK_SIZE", "80"))
 
-CLIENTE_DESCRICOES = {
+ORG_MAP = {
     "IU": ("Instituto Unibanco (IU)",
            "O Instituto Unibanco (IU) é uma organização sem fins lucrativos que apoia redes estaduais de ensino na melhoria da gestão educacional por meio de projetos como o Jovem de Futuro, produção de conhecimento e apoio técnico a secretarias de educação."),
     "FMCSV": ("Fundação Maria Cecilia Souto Vidigal (FMCSV)",
