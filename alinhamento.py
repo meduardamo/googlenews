@@ -33,7 +33,7 @@ MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 DELETE_INVALID = os.getenv("DELETE_INVALID", "1").strip() in ("1","true","True","yes","on")
 DELETE_CHUNK_SIZE = int(os.getenv("DELETE_CHUNK_SIZE", "80"))
 
-ORG_MAP = {
+CLIENTE_DESCRICOES = {
     "IU": ("Instituto Unibanco (IU)",
            "O Instituto Unibanco (IU) é uma organização sem fins lucrativos que apoia redes estaduais de ensino na melhoria da gestão educacional por meio de projetos como o Jovem de Futuro, produção de conhecimento e apoio técnico a secretarias de educação."),
     "FMCSV": ("Fundação Maria Cecilia Souto Vidigal (FMCSV)",
@@ -59,11 +59,11 @@ ORG_MAP = {
     "Mevo": ("Mevo",
              "A Mevo é uma healthtech brasileira que integra soluções de saúde digital (da prescrição eletrônica à compra/entrega de medicamentos) conectando médicos, hospitais, farmácias e pacientes para tornar o cuidado mais simples e rastreável."),
     "Coletivo Feminista": ("Coletivo Feminista",
-                          "O Coletivo Feminista é um movimento feminista que atua pela descriminalização e legalização do aborto no Brasil, articulando pesquisa, incidência política e mobilização social."),
+                          "O Coletivo Feminista é um movimento feminista que atua pela descriminalização e legalização do aborto no Brasil, articulando pesquisa, incidência política e mobilização social. Seus princípios ético-políticos abrangem a comunicação como direito e fundamento da democracia, a defesa do Estado democrático de direito, a compreensão de que maternidade não é dever e deve respeitar a liberdade de escolha, a promoção de uma atenção universal, equânime e integral à saúde — com ênfase no papel do SUS, no acesso a métodos contraceptivos e abortivos seguros e no respeito à autodeterminação reprodutiva —, além da defesa da descriminalização e legalização do aborto."),
     "IDEC": ("Instituto Brasileiro de Defesa do Consumidor (Idec)",
-             "O Instituto Brasileiro de Defesa do Consumidor (Idec) é uma associação civil sem fins lucrativos e independente de empresas, partidos ou governos, fundada em 1987."),
+             "O Instituto Brasileiro de Defesa do Consumidor (Idec) é uma associação civil sem fins lucrativos e independente de empresas, partidos ou governos, fundada em 1987. Atua na defesa dos direitos dos consumidores e na promoção de relações de consumo éticas, seguras e sustentáveis. Sua agenda combina advocacy, pesquisa e litigância estratégica, com foco em temas como saúde, alimentação, energia, telecomunicações e proteção de dados pessoais. O Idec se destaca na promoção de políticas públicas voltadas à alimentação saudável, ao controle de ultraprocessados e agrotóxicos, à rotulagem nutricional, à transição energética justa e à regulação de plataformas digitais."),
     "Umane": ("Umane",
-              "A Umane é uma organização da sociedade civil, isenta e sem fins lucrativos, que atua para fomentar melhorias sistêmicas na saúde pública no Brasil.")
+              "A Umane é uma organização da sociedade civil, isenta e sem fins lucrativos, que atua para fomentar melhorias sistêmicas na saúde pública no Brasil, apoiando iniciativas baseadas em evidências para ampliar equidade, eficiência e qualidade do sistema. Trabalha com fomento a projetos, articulação com parceiros e monitoramento e avaliação, com frentes como Atenção Primária à Saúde (APS), Doenças Crônicas Não Transmissíveis (DCNT) e saúde da mulher, da criança e do adolescente.")
 }
 
 PROMPT = Template(r"""
