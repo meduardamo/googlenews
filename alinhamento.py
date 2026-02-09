@@ -223,7 +223,6 @@ def _delete_rows_in_chunks(ws, rows_1based, chunk_size=80):
 def _is_invalid_alignment(v):
     s = str(v).strip().lower()
     return s in (
-        "não alinha", "nao alinha", "nãoalinha", "naoalinha",
         "não se aplica", "nao se aplica", "não seaplica", "nao seaplica",
         "nao-se-aplica", "não-se-aplica"
     )
