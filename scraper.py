@@ -1,8 +1,3 @@
-# Coleta notícias e grava direto no Google Sheets (uma aba por cliente)
-# - Cada aba mostra só as keywords do próprio cliente.
-# - Blindagem 50k chars por célula (truncamento) + opção de split do texto em p1..pN.
-# - INSERE novas linhas no topo (linha 2), não sobrescreve e não duplica (chave: URL).
-
 import os, re, time, sys
 from datetime import datetime, timedelta, date
 
@@ -151,7 +146,7 @@ class ColetorNoticias:
             'Conass (via GN)': 'https://news.google.com/rss/search?q=site:conass.org.br',
             'Conasems (via GN)': 'https://news.google.com/rss/search?q=site:conasems.org.br',
             'INEP (via GN)': 'https://news.google.com/rss/search?q=site:inep.gov.br',
-            'CNE (via GN)': 'https://news.google.com/rss/search?q=site:portal.mec.gov.br/conselho-nacional-de-educacao',
+            'CNE (via GN)': 'https://news.google.com/rss/search?q=site:portal.mec.gov.br/cne',
 
             # Educação / Social
             'Revista Piauí': 'https://piaui.folha.uol.com.br/feed/',
@@ -311,20 +306,27 @@ class ColetorNoticias:
         header, rows = values[0], values[1:]
         if not any(h.strip() for h in header):
             return pd.DataFrame()
-        # normaliza largura
         width = len(header)
         norm_rows = [r + [""] * (width - len(r)) for r in rows]
         df = pd.DataFrame(norm_rows, columns=[h.strip() for h in header])
         return df
 
-    def _ensure_header(self, ws, columns):
-        # se a primeira linha não tiver cabeçalho, escreve
+    def _ensure_header(self, ws, columns, min_rows=100, min_cols=None):
         values = ws.get_all_values()
-        if not values or not values[0] or not any(v.strip() for v in values[0]):
-            tmp = pd.DataFrame(columns=columns)
-            set_with_dataframe(ws, tmp, include_index=False, include_column_header=True, resize=True)
-            return True
-        return False
+        has_header = bool(values and values[0] and any(v.strip() for v in values[0]))
+
+        if min_cols is None:
+            min_cols = max(20, len(columns))
+
+        if not has_header:
+            ws.update('A1', [columns])
+
+        if ws.row_count < max(2, min_rows):
+            ws.resize(rows=max(2, min_rows))
+        if ws.col_count < min_cols:
+            ws.resize(cols=min_cols)
+
+        return not has_header
 
     def exportar_por_cliente_para_sheets(self, spreadsheet_id: str, apenas_hoje=True):
         if self.df_noticias.empty:
@@ -355,7 +357,6 @@ class ColetorNoticias:
             mask = df['palavras_por_cliente'].astype(str).str.contains(rf'\b{re.escape(cliente)}=', regex=True)
             sub = df[mask].copy()
 
-            # mantém só as keywords do cliente
             if not sub.empty:
                 sub['palavras_por_cliente'] = sub['palavras_por_cliente'].astype(str).map(
                     lambda cell, c=cliente: self._somente_kws_do_cliente(cell, c)
@@ -372,12 +373,11 @@ class ColetorNoticias:
                         parts_cols.append(f"texto_completo_p{len(parts_cols)+1}")
                     return chunks
 
-                all_chunks = sub['texto_completo'].apply(split_row_text) if not sub.empty else pd.Series([])
+                all_chunks = sub['texto_completo'].apply(split_row_text) if not sub.empty else pd.Series([], dtype=object)
                 for idx, colname in enumerate(parts_cols):
                     sub[colname] = all_chunks.apply(lambda lst, i=idx: lst[i] if i < len(lst) else "") if not all_chunks.empty else []
                 sub.drop(columns=['texto_completo'], inplace=True, errors='ignore')
 
-            # ordem de colunas
             base_cols = ['data_publicacao','titulo','fonte','url','palavras_por_cliente','resumo','data_coleta']
             if SHEETS_SPLIT_TEXT:
                 parts = [c for c in sub.columns if c.startswith('texto_completo_p')]
@@ -386,19 +386,16 @@ class ColetorNoticias:
             else:
                 cols = base_cols[:4] + ['palavras_por_cliente','resumo','texto_completo','data_coleta']
 
-            # garante somente colunas existentes e na ordem
             cols = [c for c in cols if c in sub.columns] if not sub.empty else cols
             sub = sub[cols] if not sub.empty else pd.DataFrame(columns=cols)
 
-            # última barreira: garante que nada passa de 50k
             sub = _enforce_sheet_limits(sub, MAX_CELL_CHARS)
 
             ws = self._get_or_create_ws(sh, cliente)
 
-            # garante cabeçalho (só na primeira vez que a aba existe)
-            self._ensure_header(ws, cols)
+            # garante cabeçalho e um grid mínimo (evita o erro do startIndex)
+            self._ensure_header(ws, cols, min_rows=100, min_cols=max(20, len(cols)))
 
-            # dedup contra o que JÁ está na planilha (por URL)
             existing_df = self._read_ws_df(ws)
             existing_urls = set()
             url_col_name = None
@@ -415,6 +412,14 @@ class ColetorNoticias:
             if sub.empty:
                 print(f"✓ Aba {ws.title}: nada novo para inserir.")
                 continue
+
+            # Garante que existe pelo menos a linha 2
+            if ws.row_count < 2:
+                ws.resize(rows=2)
+
+            # (opcional) garante colunas suficientes
+            if ws.col_count < max(20, len(cols)):
+                ws.resize(cols=max(20, len(cols)))
 
             # INSERE LINHAS no topo (a partir da linha 2)
             ws.insert_rows([[]] * len(sub), row=2, value_input_option="RAW")
