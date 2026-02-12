@@ -167,7 +167,7 @@ class ColetorNoticias:
             'Folha de Pernambuco': 'https://www.folhape.com.br/?format=feed&type=rss',
 
             # CNM
-            'CNM (via Google News)': 'https://news.google.com/rss/search?q=site:cnm.org.br&hl=pt-BR&gl=BR&ceid=BR:pt-419'
+            'CNM (via Google News)': 'https://news.google.com/rss/search?q=site:cnm.org.br&hl=pt-BR&gl=BR&ceid=BR:pt-419',
 
             # CONSED
             'CONSED (via Google News)': 'https://news.google.com/rss/search?q=site:consed.org.br&hl=pt-BR&gl=BR&ceid=BR:pt-419',
