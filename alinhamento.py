@@ -29,11 +29,9 @@ SKIP_TITLES = [s.strip() for s in os.getenv("ALIGN_SKIP_TABS", "").split(",") if
 
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 
-# Liga a remoção automática (tira Não Alinha e Não se aplica)
 DELETE_INVALID = os.getenv("DELETE_INVALID", "1").strip() in ("1","true","True","yes","on")
 DELETE_CHUNK_SIZE = int(os.getenv("DELETE_CHUNK_SIZE", "80"))
 
-# MAPA: ABA -> (NOME, DESCRIÇÃO)
 CLIENTE_DESCRICOES = {
     "IU": ("Instituto Unibanco (IU)",
            "O Instituto Unibanco (IU) é uma organização sem fins lucrativos que atua no fortalecimento da gestão educacional, desenvolvendo projetos como o Jovem de Futuro, oferecendo apoio técnico a secretarias estaduais de educação e produzindo conhecimento para aprimorar políticas públicas. Seu foco está tanto no cenário federal, acompanhando os debates sobre o financiamento da educação, programas nacionais de educação, regulação educacional e diretrizes definidas por órgãos como o Conselho Nacional de Educação, quanto subnacional, olhando para 6 estados prioritários (RS, MG, ES, CE, PI e GO). O IU apoia iniciativas de recomposição de aprendizagens, infraestrutura escolar, inclusão digital, educação ambiental, mudanças do clima e valorização de profissionais da educação."),
@@ -71,8 +69,8 @@ CLIENTE_DESCRICOES = {
                 "O Instituto Futuro é Infância Saudável (Infinis) é a frente de filantropia estratégica e advocacy da Fundação José Luiz Setúbal (FJLS). A organização atua com base em evidências científicas para promover políticas públicas, fortalecer a sociedade civil e impulsionar soluções que assegurem saúde e bem-estar na infância. Sua atuação está estruturada em quatro eixos temáticos: segurança alimentar e enfrentamento da má nutrição; saúde mental; prevenção às violências; e fortalecimento da sociedade civil, alinhados aos ODS da ONU. Com foco na incidência política, busca contribuir para o aprimoramento e a efetiva implementação de políticas públicas, além de fomentar a transformação de comportamentos e o desenvolvimento de soluções locais sustentáveis."),
 }
 
-PROMPT = Template(r"""
-Você é analista de políticas públicas e faz triagem de atos do DOU, matérias legislativas e notícias para um(a) cliente.
+PROMPT = Template(
+"""Você é analista de políticas públicas e faz triagem de atos do DOU, matérias legislativas e notícias para um(a) cliente.
 
 Missão/escopo do cliente:
 $descricao
@@ -81,18 +79,27 @@ Tarefa:
 Classificar o alinhamento do **Conteúdo** com a missão do cliente.
 
 Regras de evidência:
-- Use **apenas** o Conteúdo. Não use contexto externo.
+- Use **apenas** o Conteúdo e a descrição do cliente acima. Não utilize conhecimento próprio sobre o cliente além do que está descrito neste prompt.
 - NÃO exija que o Conteúdo cubra TODA a missão do cliente.
   # Se o Conteúdo estiver claramente dentro de ao menos UMA frente/eixo relevante do cliente, marque "Alinha".
   # A ausência de menção a outras frentes (ex.: socioemocional) NÃO reduz automaticamente para "Parcial".
-- Use "Parcial" apenas quando houver INSUFICIÊNCIA ou AMBIGUIDADE no texto para decidir.
+- Use "Parcial" apenas nos dois casos descritos abaixo — não como classe-padrão para dúvidas genéricas.
 - Se o texto for claramente de natureza incompatível com triagem temática (ex.: decisão sobre caso individual sem política pública; deferimento/indeferimento nominal; concessão pontual; nomeação/dispensa rotineira sem tema; mero expediente administrativo sem objeto; publicação que não permite inferir assunto), marque "Não se aplica".
 
 Classes (escolha exatamente UMA):
 - "Alinha": O objeto/tema do Conteúdo é claro e há evidência explícita de relação com pelo menos 1 frente/eixo do cliente.
-- "Parcial": O Conteúdo sugere relação, mas é genérico, incompleto ou não permite identificar com segurança o objeto/tema.
+- "Parcial": Use SOMENTE em um destes dois casos:
+    (a) Ambiguidade temática — o Conteúdo trata de tema que poderia ou não se encaixar na missão, mas o texto é insuficiente para decidir com segurança;
+    (b) Cobertura incompleta — o Conteúdo aborda parcialmente o tema do cliente, mas mistura substancialmente outras agendas não relacionadas, de modo que a relevância é real porém limitada.
 - "Não Alinha": O tema é claro e não tem relação com a missão do cliente.
 - "Não se aplica": O Conteúdo não é classificável por tema/escopo do cliente com base no texto (exemplos acima), ou é predominantemente ato individual/procedimental sem política pública inferível.
+
+Restrições estruturais obrigatórias:
+- NÃO inclua qualquer metacomentário sobre a classificação.
+- NÃO mencione que está classificando, analisando ou respondendo ao prompt.
+- A justificativa deve conter APENAS uma descrição objetiva do que o Conteúdo trata (objeto/tema).
+- NÃO explique impactos potenciais, intenções do autor ou interpretações jurídicas.
+- NÃO utilize linguagem avaliativa ou argumentativa.
 
 Formato de saída:
 Retorne **somente** JSON válido neste formato:
@@ -102,8 +109,10 @@ Retorne **somente** JSON válido neste formato:
 }
 
 Conteúdo:
-\"\"\"$conteudo\"\"\"
-""".strip())
+<conteudo>
+$conteudo
+</conteudo>""".strip()
+)
 
 genai_client = genai.Client(api_key=GENAI_API_KEY)
 
@@ -198,7 +207,9 @@ def classify_content(conteudo: str, descricao_cliente: str) -> dict:
             "alinhamento": "Parcial",
             "justificativa": "Sem conteúdo em título, resumo ou texto; não é possível concluir o alinhamento."
         }
-    prompt_text = PROMPT.substitute(descricao=descricao_cliente, conteudo=conteudo)
+    # Sanitiza o conteúdo para não quebrar o delimitador XML do prompt.
+    conteudo_safe = conteudo.replace("</conteudo>", "</conteudo\u200b>")
+    prompt_text = PROMPT.substitute(descricao=descricao_cliente, conteudo=conteudo_safe)
     return call_gemini(prompt_text)
 
 def _range_start_row(read_range: str) -> int:
