@@ -1,4 +1,4 @@
-import os, re, time, sys
+import os, re, time, sys, random
 from datetime import datetime, timedelta, date
 
 import feedparser
@@ -10,17 +10,29 @@ from gspread_dataframe import set_with_dataframe
 from google.oauth2.service_account import Credentials
 
 # Limites e flags
-# Margem pra baixo do teto de 50k do Sheets
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
-# Se 1/true → quebra 'texto_completo' em colunas p1..pN; senão só trunca.
 SHEETS_SPLIT_TEXT = os.getenv("SHEETS_SPLIT_TEXT", "0").strip() in ("1","true","True","yes","on")
 
-# Helpers de limpeza/limite
+# ── retry helper ──────────────────────────────────────────────────────────────
+def _gsheets_with_retry(fn, *args, max_retries=6, **kwargs):
+    """Chama fn(*args, **kwargs) com backoff exponencial em caso de 429."""
+    for attempt in range(max_retries):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            status = getattr(e.response, 'status_code', None)
+            if status == 429 and attempt < max_retries - 1:
+                wait = (2 ** attempt) + random.uniform(0, 1)
+                print(f"  ⚠ Rate limited (429). Aguardando {wait:.1f}s (tentativa {attempt+1}/{max_retries})...")
+                time.sleep(wait)
+            else:
+                raise
+
+# ── helpers de limpeza/limite ─────────────────────────────────────────────────
 def _clean_text(s: str) -> str:
     if s is None:
         return ""
     s = str(s)
-    # remove controles (char < 32) exceto \n; remove DEL (127)
     return "".join(ch for ch in s if (ch == "\n") or ((ord(ch) >= 32) and (ord(ch) != 127)))
 
 def _truncate(s: str, limit: int = MAX_CELL_CHARS) -> str:
@@ -36,13 +48,12 @@ def _split_in_chunks(s: str, limit: int = MAX_CELL_CHARS):
     return [s[i:i + limit] for i in range(0, len(s), limit)]
 
 def _enforce_sheet_limits(df: pd.DataFrame, limit: int = MAX_CELL_CHARS):
-    # Garante que nenhuma célula (objeto/string) passe do limite
     for c in df.columns:
         if df[c].dtype == object or str(df[c].dtype).startswith("string"):
             df[c] = df[c].astype(str).map(lambda v: _truncate(v, limit))
     return df
 
-# Mapa: Cliente → Tema → Keywords (whole-word)
+# ── dados clientes ────────────────────────────────────────────────────────────
 CLIENT_THEME_DATA = """
 IAS|Educação|matemática; alfabetização; alfabetização matemática; recomposição de aprendizagem; plano nacional de educação
 ISG|Educação|tempo integral; fundeb; ensino técnico profissionalizante; educação profissional e tecnológica; ensino médio; propag; infraestrutura escolar; ensino fundamental integral; alfabetização integral; escola em tempo integral; programa escola em tempo integral; ensino fundamental em tempo integral
@@ -60,6 +71,7 @@ Coletivo Feminista|Direitos reprodutivos|aborto; nascituro; gestação acima de 
 IDEC|Saúde|defesa do consumidor; ação civil pública; sac; reforma tributária; ultraprocessados; doenças crônicas não transmissíveis; dcnts; obesidade; codex alimentarius; gordura trans; adoçantes; edulcorantes; rotulagem de alimentos; transgênicos; organismos geneticamente modificados; ogms; marketing e publicidade de alimentos; comunicação mercadológica; escolas e alimentação escolar; bebidas açucaradas; refrigerante; programa nacional de alimentação escolar; pnae; educação alimentar e nutricional; ean; agrotóxicos; pesticidas; defensivos fitossanitários; tributação de alimentos não saudáveis; desertos alimentares; desperdício de alimentos; segurança alimentar e nutricional; direito humano à alimentação; fome; sustentabilidade; mudança climática; plástico; gestão de resíduos; economia circular; desmatamento; greenwashing; energia elétrica; encargos tarifários; subsídios na tarifa de energia; descontos na tarifa de energia; energia pré-paga; abertura do mercado de energia para consumidor cativo; mercado livre de energia; qualidade do serviço de energia; serviço de energia; tarifa social de energia elétrica; geração térmica; combustíveis fósseis; transição energética; descarbonização da matriz elétrica; descarbonização; gases de efeito estufa; acordo de paris; objetivos do desenvolvimento sustentável; reestruturação do setor de energia; reforma do setor elétrico; modernização do setor elétrico; itens de custo da tarifa de energia elétrica; universalização do acesso à energia; eficiência energética; geração distribuída; carvão mineral; painel solar; crédito imobiliário; crédito consignado; publicidade de crédito; cartão de crédito; pagamento de fatura; parcelamento com e sem juros; cartões pré-pagos; programas de fidelidade; cheque especial; taxa de juros; contrato de crédito; endividamento de jovens; crédito estudantil; endividamento de idosos; crédito por meio de aplicativos; abertura e movimentação de conta bancária; cobrança de serviços sem autorização; cadastro positivo; contratação de serviços bancários com imposição de seguros e títulos de capitalização; acessibilidade aos canais de serviços bancários; serviços bancários; caixa eletrônico; internet banking; aplicativos móveis; contratação de pacotes de contas bancárias; acesso à informação em caso de negativa de crédito; plano de saúde; saúde suplementar; medicamentos isentos de prescrição; mip; medicamentos antibióticos; antimicrobianos; propriedade intelectual; patentes; licença compulsória; preços de medicamentos; complexo econômico-industrial da saúde; saúde digital; prontuário eletrônico; rede nacional de dados em saúde; rnds; datasus; proteção de dados pessoais; telessaúde; telecomunicações; internet; tv por assinatura; serviço de acesso condicionado; telefonia móvel; telefonia fixa; tv digital; lei geral de proteção de dados; autoridade nacional de proteção de dados; reconhecimento facial; lei geral de telecomunicações; bens reversíveis; fundo de universalização dos serviços de telecomunicações; provedores de acesso; franquia de internet; marco civil da internet; neutralidade de rede; zero rating; privacidade; lei de acesso à informação; regulação de plataformas digitais; desinformação; fake news; dados biométricos; vazamento de dados; telemarketing; serviço de valor adicionado
 """.strip()
 
+
 def parse_client_theme_data(raw: str):
     mapping = {}
     for line in raw.splitlines():
@@ -71,11 +83,12 @@ def parse_client_theme_data(raw: str):
         mapping[cliente] = {'tema': tema, 'keywords': keywords}
     return mapping
 
+
 def make_wholeword_pattern(term: str):
     return re.compile(rf'\b{re.escape(term)}\b', flags=re.IGNORECASE)
 
+
 def parse_palavras_por_cliente_cell(cell: str):
-    # Ex.: "IAS=PNE|Alfabetização; IEPS=SUS"
     out = {}
     if not isinstance(cell, str) or not cell.strip():
         return out
@@ -89,14 +102,15 @@ def parse_palavras_por_cliente_cell(cell: str):
         out[k] = kws
     return out
 
+
 class ColetorNoticias:
     def __init__(self, timezone_offset_hours=0, deduplicar=True):
         self.tz_offset = timedelta(hours=timezone_offset_hours)
         self.deduplicar = deduplicar
         self._seen_urls = set()
         self.df_noticias = pd.DataFrame(columns=[
-            'data_publicacao','titulo','fonte','url',
-            'palavras_por_cliente','resumo','texto_completo','data_coleta'
+            'data_publicacao', 'titulo', 'fonte', 'url',
+            'palavras_por_cliente', 'resumo', 'texto_completo', 'data_coleta'
         ])
         self.clientes = parse_client_theme_data(CLIENT_THEME_DATA)
         self.cliente_patterns = {
@@ -104,7 +118,9 @@ class ColetorNoticias:
             for c, data in self.clientes.items()
         }
 
-        # feeds habilitados
+        # Cache de worksheets: { spreadsheet_id: { ws_title: ws_object } }
+        self._ws_cache = {}
+
         self.feeds = {
             # Base
             'G1 Política': 'https://g1.globo.com/rss/g1/politica/',
@@ -171,10 +187,9 @@ class ColetorNoticias:
 
             # CONSED
             'CONSED (via Google News)': 'https://news.google.com/rss/search?q=site:consed.org.br&hl=pt-BR&gl=BR&ceid=BR:pt-419',
-            
         }
 
-    # ==== datas ====
+    # ── datas ──────────────────────────────────────────────────────────────────
     def _entry_datetime(self, entrada):
         dt = None
         if hasattr(entrada, 'published_parsed') and entrada.published_parsed:
@@ -192,7 +207,7 @@ class ColetorNoticias:
     def _eh_hoje(self, dt_obj):
         return bool(dt_obj) and dt_obj.date() == date.today()
 
-    # matching
+    # ── matching ───────────────────────────────────────────────────────────────
     def _hits_por_cliente(self, texto):
         hits = {}
         base = texto or ""
@@ -208,7 +223,7 @@ class ColetorNoticias:
     def _format_palavras_por_cliente(self, hits_dict):
         return "; ".join(f"{cli}=" + "|".join(kws) for cli, kws in hits_dict.items())
 
-    # dedup interno
+    # ── dedup interno ──────────────────────────────────────────────────────────
     def noticia_existe(self, url):
         if not self.deduplicar:
             return False
@@ -221,7 +236,7 @@ class ColetorNoticias:
         self.df_noticias = pd.concat([self.df_noticias, pd.DataFrame([noticia])], ignore_index=True)
         return True
 
-    # extração de corpo
+    # ── extração de corpo ──────────────────────────────────────────────────────
     def extrair_texto_completo(self, url):
         try:
             art = Article(url, language='pt')
@@ -231,7 +246,7 @@ class ColetorNoticias:
         except Exception:
             return ""
 
-    # coleta
+    # ── coleta ─────────────────────────────────────────────────────────────────
     def coletar_feeds(self, extrair_texto=False, apenas_hoje=True, pausa_seg=0.2):
         total_novas = 0
         print(f"\nIniciando coleta de {len(self.feeds)} fontes...\n" + "=" * 80)
@@ -284,20 +299,34 @@ class ColetorNoticias:
         print(f"Total novas: {total_novas} | Total na sessão: {len(self.df_noticias)}")
         return total_novas
 
-    # Google Sheets
+    # ── Google Sheets ──────────────────────────────────────────────────────────
     def _gsheets_client(self):
         creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "credentials.json")
-        scopes = ["https://www.googleapis.com/auth/spreadsheets",
-                  "https://www.googleapis.com/auth/drive"]
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
         creds = Credentials.from_service_account_file(creds_path, scopes=scopes)
         return gspread.authorize(creds)
 
+    def _build_ws_cache(self, sh):
+        """Carrega todas as abas de uma vez (1 read request) e popula o cache."""
+        worksheets = _gsheets_with_retry(sh.worksheets)
+        self._ws_cache[sh.id] = {ws.title: ws for ws in worksheets}
+
     def _get_or_create_ws(self, sh, title):
+        """Retorna worksheet pelo título, criando se necessário — sem read extra."""
         name = title[:31]
-        try:
-            return sh.worksheet(name)
-        except gspread.WorksheetNotFound:
-            return sh.add_worksheet(title=name, rows=100, cols=20)
+
+        # Garante que o cache do spreadsheet está populado
+        if sh.id not in self._ws_cache:
+            self._build_ws_cache(sh)
+
+        if name not in self._ws_cache[sh.id]:
+            ws = _gsheets_with_retry(sh.add_worksheet, title=name, rows=100, cols=20)
+            self._ws_cache[sh.id][name] = ws
+
+        return self._ws_cache[sh.id][name]
 
     def _somente_kws_do_cliente(self, cell, cliente):
         try:
@@ -307,7 +336,7 @@ class ColetorNoticias:
             return ""
 
     def _read_ws_df(self, ws):
-        values = ws.get_all_values()
+        values = _gsheets_with_retry(ws.get_all_values)
         if not values:
             return pd.DataFrame()
         header, rows = values[0], values[1:]
@@ -319,19 +348,19 @@ class ColetorNoticias:
         return df
 
     def _ensure_header(self, ws, columns, min_rows=100, min_cols=None):
-        values = ws.get_all_values()
+        values = _gsheets_with_retry(ws.get_all_values)
         has_header = bool(values and values[0] and any(v.strip() for v in values[0]))
 
         if min_cols is None:
             min_cols = max(20, len(columns))
 
         if not has_header:
-            ws.update('A1', [columns])
+            _gsheets_with_retry(ws.update, 'A1', [columns])
 
         if ws.row_count < max(2, min_rows):
-            ws.resize(rows=max(2, min_rows))
+            _gsheets_with_retry(ws.resize, rows=max(2, min_rows))
         if ws.col_count < min_cols:
-            ws.resize(cols=min_cols)
+            _gsheets_with_retry(ws.resize, cols=min_cols)
 
         return not has_header
 
@@ -348,12 +377,14 @@ class ColetorNoticias:
         gc = self._gsheets_client()
         sh = gc.open_by_key(spreadsheet_id)
 
-        # sanitiza + trunca os campos base (título/resumo/fonte/url)
+        # Carrega todas as abas de uma vez → apenas 1 read request
+        self._build_ws_cache(sh)
+
+        # Sanitiza campos base
         for col in ['titulo', 'resumo', 'fonte', 'url']:
             if col in df.columns:
                 df[col] = df[col].astype(str).map(_truncate)
 
-        # texto_completo: trunca se não for split; se for split, só limpa
         if 'texto_completo' in df.columns:
             if SHEETS_SPLIT_TEXT:
                 df['texto_completo'] = df['texto_completo'].astype(str).map(_clean_text)
@@ -361,7 +392,9 @@ class ColetorNoticias:
                 df['texto_completo'] = df['texto_completo'].astype(str).map(_truncate)
 
         for cliente in self.clientes.keys():
-            mask = df['palavras_por_cliente'].astype(str).str.contains(rf'\b{re.escape(cliente)}=', regex=True)
+            mask = df['palavras_por_cliente'].astype(str).str.contains(
+                rf'\b{re.escape(cliente)}=', regex=True
+            )
             sub = df[mask].copy()
 
             if not sub.empty:
@@ -382,25 +415,29 @@ class ColetorNoticias:
 
                 all_chunks = sub['texto_completo'].apply(split_row_text) if not sub.empty else pd.Series([], dtype=object)
                 for idx, colname in enumerate(parts_cols):
-                    sub[colname] = all_chunks.apply(lambda lst, i=idx: lst[i] if i < len(lst) else "") if not all_chunks.empty else []
+                    sub[colname] = all_chunks.apply(
+                        lambda lst, i=idx: lst[i] if i < len(lst) else ""
+                    ) if not all_chunks.empty else []
                 sub.drop(columns=['texto_completo'], inplace=True, errors='ignore')
 
-            base_cols = ['data_publicacao','titulo','fonte','url','palavras_por_cliente','resumo','data_coleta']
+            base_cols = ['data_publicacao', 'titulo', 'fonte', 'url', 'palavras_por_cliente', 'resumo', 'data_coleta']
             if SHEETS_SPLIT_TEXT:
                 parts = [c for c in sub.columns if c.startswith('texto_completo_p')]
-                parts.sort(key=lambda x: int(x.rsplit('p',1)[-1]))
-                cols = base_cols[:4] + ['palavras_por_cliente','resumo'] + parts + ['data_coleta']
+                parts.sort(key=lambda x: int(x.rsplit('p', 1)[-1]))
+                cols = base_cols[:4] + ['palavras_por_cliente', 'resumo'] + parts + ['data_coleta']
             else:
-                cols = base_cols[:4] + ['palavras_por_cliente','resumo','texto_completo','data_coleta']
+                cols = base_cols[:4] + ['palavras_por_cliente', 'resumo', 'texto_completo', 'data_coleta']
 
             cols = [c for c in cols if c in sub.columns] if not sub.empty else cols
             sub = sub[cols] if not sub.empty else pd.DataFrame(columns=cols)
-
             sub = _enforce_sheet_limits(sub, MAX_CELL_CHARS)
 
+            # _get_or_create_ws usa o cache — sem read extra
             ws = self._get_or_create_ws(sh, cliente)
 
-            # garante cabeçalho e um grid mínimo (evita o erro do startIndex)
+            # Pausa entre clientes para não estourar a cota de writes
+            time.sleep(1.2)
+
             self._ensure_header(ws, cols, min_rows=100, min_cols=max(20, len(cols)))
 
             existing_df = self._read_ws_df(ws)
@@ -420,18 +457,14 @@ class ColetorNoticias:
                 print(f"✓ Aba {ws.title}: nada novo para inserir.")
                 continue
 
-            # Garante que existe pelo menos a linha 2
             if ws.row_count < 2:
-                ws.resize(rows=2)
+                _gsheets_with_retry(ws.resize, rows=2)
 
-            # (opcional) garante colunas suficientes
             if ws.col_count < max(20, len(cols)):
-                ws.resize(cols=max(20, len(cols)))
+                _gsheets_with_retry(ws.resize, cols=max(20, len(cols)))
 
-            # INSERE LINHAS no topo (a partir da linha 2)
-            ws.insert_rows([[]] * len(sub), row=2, value_input_option="RAW")
+            _gsheets_with_retry(ws.insert_rows, [[]] * len(sub), row=2, value_input_option="RAW")
 
-            # escreve os dados a partir de A2, sem header
             set_with_dataframe(
                 ws,
                 sub,
@@ -439,11 +472,12 @@ class ColetorNoticias:
                 col=1,
                 include_index=False,
                 include_column_header=False,
-                resize=False
+                resize=False,
             )
             print(f"✓ Inseridas {len(sub)} linhas no topo da aba: {ws.title}")
 
-# Main
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
     if not SPREADSHEET_ID:
@@ -451,20 +485,20 @@ if __name__ == "__main__":
         sys.exit(1)
 
     tz = int(os.getenv("TZ_OFFSET_HOURS", "-3"))
-    extrair = os.getenv("EXTRACT_BODY", "1").strip() in ("1","true","True","yes","on")
+    extrair = os.getenv("EXTRACT_BODY", "1").strip() in ("1", "true", "True", "yes", "on")
 
     coletor = ColetorNoticias(
         timezone_offset_hours=tz,
-        deduplicar=True
+        deduplicar=True,
     )
 
     coletor.coletar_feeds(
         extrair_texto=extrair,
         apenas_hoje=True,
-        pausa_seg=0.2
+        pausa_seg=0.2,
     )
 
     coletor.exportar_por_cliente_para_sheets(
         spreadsheet_id=SPREADSHEET_ID,
-        apenas_hoje=True
+        apenas_hoje=True,
     )
