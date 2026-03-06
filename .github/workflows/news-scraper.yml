@@ -63,10 +63,5 @@ jobs:
           GOOGLE_APPLICATION_CREDENTIALS: credentials.json
           PLANILHA: ${{ secrets.PLANILHA }}
           GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
-          # tuning opcional:
-          # GENAI_MODEL: "gemini-2.0-flash"
-          # ALIGN_BATCH_SIZE: "20"
-          # ALIGN_SLEEP_SEC: "0"
-          # ALIGN_READ_RANGE: "A1:Z5000"
         run: |
           python alinhamento.py
