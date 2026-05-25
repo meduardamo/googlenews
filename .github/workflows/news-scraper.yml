@@ -2,8 +2,7 @@ name: Coletor de Notícias
 
 on:
   schedule:
-    - cron: "0 8 * * *"   # 05:00 BRT
-    - cron: "0 12 * * *"  # 09:00 BRT
+    - cron: "0 11 * * *"  # 08:00 BRT
     - cron: "0 15 * * *"  # 12:00 BRT
     - cron: "0 17 * * *"  # 14:00 BRT
     - cron: "0 20 * * *"  # 17:00 BRT
