@@ -118,7 +118,19 @@ def parse_client_theme_data(raw: str):
 
 
 def make_wholeword_pattern(term: str):
-    return re.compile(rf'\b{re.escape(term)}\b', flags=re.IGNORECASE)
+    """Padrão de palavra inteira. Sigla em CAIXA ALTA casa com sensibilidade a
+    maiúscula.
+
+    Com IGNORECASE em tudo, "SUAS" (o sistema de assistência social) casava com
+    o pronome "suas" e entrava em quase toda notícia: 81% do que ele trouxe foi
+    classificado como Não Alinha. "CAPS" pegava "caps lock" pelo mesmo motivo.
+    Sigla curta só vale quando escrita como sigla.
+    """
+    termo = term.strip()
+    e_sigla = (len(termo) <= 6 and termo.isupper()
+               and termo.isalpha() and len(termo) >= 2)
+    flags = 0 if e_sigla else re.IGNORECASE
+    return re.compile(rf'\b{re.escape(termo)}\b', flags=flags)
 
 
 def parse_palavras_por_cliente_cell(cell: str):
