@@ -56,13 +56,21 @@ _ESPACOS = re.compile(r"[ \t\r\f\v]+")
 
 
 def _sem_html(s: str) -> str:
-    """Tira marcação e entidades. O 'summary' do RSS vem com <img>, <br> e o
-    texto todo dentro; sem isso o HTML vai inteiro para a planilha e para o
-    prompt de alinhamento."""
+    """Tira marcação e entidades do 'summary' do RSS.
+
+    Desescapa ANTES de remover as tags, e repete: parte dos feeds entrega o HTML
+    escapado (&lt;p&gt;), e limpar na ordem inversa deixaria a tag aparecer no
+    resultado final, já sem chance de ser removida.
+    """
     import html as _html_mod
-    s = _TAG_HTML.sub(" ", str(s or ""))
-    s = _html_mod.unescape(s)
-    return _ESPACOS.sub(" ", s).strip()
+    texto = str(s or "")
+    for _ in range(3):                       # &amp;lt;p&amp;gt; precisa de 2 voltas
+        antes = texto
+        texto = _html_mod.unescape(texto)
+        texto = _TAG_HTML.sub(" ", texto)
+        if texto == antes:
+            break
+    return _ESPACOS.sub(" ", texto).strip()
 
 
 def _truncate(s: str, limit: int = MAX_CELL_CHARS) -> str:
