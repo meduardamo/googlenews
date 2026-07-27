@@ -11,6 +11,22 @@ from google.oauth2.service_account import Credentials
 
 # Limites e flags
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
+# Teto de linhas por aba. O que derruba a planilha ("This document is too large
+# to continue editing") não é a contagem de células — medida em 27/07/2026 ela
+# estava em 1,19 milhão, 12% do limite de 10 milhões — e sim o VOLUME DE TEXTO:
+# ~716 milhões de caracteres. Com o resumo limpo (abaixo) cada linha cai de
+# ~12.000 para ~2.000 caracteres, e o teto de linhas segura o crescimento.
+LIMITE_LINHAS_ABA = int(os.getenv("LIMITE_LINHAS_ABA", "12000"))
+
+# Teto do resumo. O feed RSS entrega em 'summary' o artigo inteiro em HTML
+# (inclusive <img>), com 9.400 caracteres em média: 78% do peso do documento.
+# Resumo é para ler de relance; o corpo tem coluna própria.
+MAX_RESUMO_CHARS = int(os.getenv("MAX_RESUMO_CHARS", "1200"))
+
+# Teto do corpo. O alinhamento classifica se a notícia toca a missão do cliente;
+# alguns milhares de caracteres bastam para isso. Sem teto, a reserva do RSS
+# abaixo só transferiria o peso de 'resumo' para 'texto_completo'.
+MAX_TEXTO_CHARS = int(os.getenv("MAX_TEXTO_CHARS", "4000"))
 SHEETS_SPLIT_TEXT = os.getenv("SHEETS_SPLIT_TEXT", "0").strip() in ("1","true","True","yes","on")
 
 # ── retry helper ──────────────────────────────────────────────────────────────
@@ -34,6 +50,20 @@ def _clean_text(s: str) -> str:
         return ""
     s = str(s)
     return "".join(ch for ch in s if (ch == "\n") or ((ord(ch) >= 32) and (ord(ch) != 127)))
+
+_TAG_HTML = re.compile(r"<[^>]+>")
+_ESPACOS = re.compile(r"[ \t\r\f\v]+")
+
+
+def _sem_html(s: str) -> str:
+    """Tira marcação e entidades. O 'summary' do RSS vem com <img>, <br> e o
+    texto todo dentro; sem isso o HTML vai inteiro para a planilha e para o
+    prompt de alinhamento."""
+    import html as _html_mod
+    s = _TAG_HTML.sub(" ", str(s or ""))
+    s = _html_mod.unescape(s)
+    return _ESPACOS.sub(" ", s).strip()
+
 
 def _truncate(s: str, limit: int = MAX_CELL_CHARS) -> str:
     s = _clean_text(s)
@@ -261,7 +291,7 @@ class ColetorNoticias:
                 for e in feed.entries:
                     titulo = e.get('title', 'Sem título')
                     url = e.get('link', '')
-                    resumo = e.get('summary', '')
+                    resumo = _sem_html(e.get('summary', ''))[:MAX_RESUMO_CHARS]
 
                     dt_pub = self._entry_datetime(e)
                     if apenas_hoje and not self._eh_hoje(dt_pub):
@@ -269,6 +299,15 @@ class ColetorNoticias:
 
                     if extrair_texto:
                         corpo = self.extrair_texto_completo(url)
+                        # newspaper3k volta quase vazio em site com paywall ou
+                        # conteúdo por JS (o caso mais comum aqui: a coluna
+                        # vinha com ~300 caracteres). O 'summary' do RSS, já
+                        # limpo de HTML, é melhor corpo do que nada.
+                        if len(corpo.strip()) < 400:
+                            bruto = _sem_html(e.get('summary', ''))
+                            if len(bruto) > len(corpo.strip()):
+                                corpo = bruto
+                        corpo = _sem_html(corpo)[:MAX_TEXTO_CHARS]
                         base_match = f"{titulo} {resumo} {corpo}"
                     else:
                         corpo = ''
@@ -394,6 +433,7 @@ class ColetorNoticias:
             else:
                 df['texto_completo'] = df['texto_completo'].astype(str).map(_truncate)
 
+        falhas_abas = []
         for cliente in self.clientes.keys():
             mask = df['palavras_por_cliente'].astype(str).str.contains(
                 rf'\b{re.escape(cliente)}=', regex=True
@@ -441,7 +481,9 @@ class ColetorNoticias:
             # Pausa entre clientes para não estourar a cota de writes
             time.sleep(1.2)
 
-            self._ensure_header(ws, cols, min_rows=100, min_cols=max(20, len(cols)))
+            # min_cols era max(20, ...): coluna vazia também ocupa célula no
+            # limite do documento, então usa só o que a aba precisa.
+            self._ensure_header(ws, cols, min_rows=100, min_cols=len(cols))
 
             existing_df = self._read_ws_df(ws)
             existing_urls = set()
@@ -463,21 +505,51 @@ class ColetorNoticias:
             if ws.row_count < 2:
                 _gsheets_with_retry(ws.resize, rows=2)
 
-            if ws.col_count < max(20, len(cols)):
-                _gsheets_with_retry(ws.resize, cols=max(20, len(cols)))
+            if ws.col_count < len(cols):
+                _gsheets_with_retry(ws.resize, cols=len(cols))
 
-            _gsheets_with_retry(ws.insert_rows, [[]] * len(sub), row=2, value_input_option="RAW")
+            # A gravação de UM cliente não pode derrubar a rodada: quando a
+            # planilha estourou o limite de células, todos os clientes depois
+            # deste ficaram sem notícia, mesmo com a coleta tendo dado certo.
+            try:
+                _gsheets_with_retry(ws.insert_rows, [[]] * len(sub), row=2,
+                                    value_input_option="RAW")
 
-            set_with_dataframe(
-                ws,
-                sub,
-                row=2,
-                col=1,
-                include_index=False,
-                include_column_header=False,
-                resize=False,
-            )
+                set_with_dataframe(
+                    ws,
+                    sub,
+                    row=2,
+                    col=1,
+                    include_index=False,
+                    include_column_header=False,
+                    resize=False,
+                )
+            except Exception as e:
+                falhas_abas.append((ws.title, str(e)[:160]))
+                print(f"✗ Falhou ao gravar na aba {ws.title}: {e}")
+                continue
             print(f"✓ Inseridas {len(sub)} linhas no topo da aba: {ws.title}")
+
+            # As novas entram no topo, então o excedente é a cauda antiga.
+            if LIMITE_LINHAS_ABA > 0 and ws.row_count > LIMITE_LINHAS_ABA + 1:
+                sobra = ws.row_count - (LIMITE_LINHAS_ABA + 1)
+                try:
+                    _gsheets_with_retry(ws.delete_rows,
+                                        LIMITE_LINHAS_ABA + 2, ws.row_count)
+                    print(f"  ↳ aparadas {sobra} linhas antigas (teto {LIMITE_LINHAS_ABA})")
+                except Exception as e:
+                    print(f"  ↳ não consegui aparar a aba {ws.title}: {e}")
+
+        if falhas_abas:
+            print("\n" + "=" * 80)
+            print(f"{len(falhas_abas)} aba(s) não receberam dados:")
+            for _aba, _erro in falhas_abas:
+                print(f"  - {_aba}: {_erro}")
+            if any("too large" in _e for _, _e in falhas_abas):
+                print("\nA planilha bateu o limite de 10 milhões de células do "
+                      "Google Sheets. Reduza LIMITE_LINHAS_ABA ou desligue "
+                      "SHEETS_SPLIT_TEXT/EXTRACT_BODY, que é o que engorda cada linha.")
+            raise SystemExit(1)
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
