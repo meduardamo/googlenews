@@ -6,8 +6,8 @@ from google.oauth2.service_account import Credentials
 from google import genai
 from string import Template
 
-GENAI_API_KEY = os.getenv("GENAI_API_KEY", "").strip()
-assert GENAI_API_KEY, "Defina o secret GENAI_API_KEY."
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+assert GEMINI_API_KEY, "Defina o secret GEMINI_API_KEY."
 MODEL_NAME = os.getenv("GENAI_MODEL", "gemini-3.6-flash").strip()
 
 PLANILHA = os.getenv("PLANILHA", "").strip()
@@ -144,7 +144,7 @@ $conteudo
 </conteudo>""".strip()
 )
 
-genai_client = genai.Client(api_key=GENAI_API_KEY)
+genai_client = genai.Client(api_key=GEMINI_API_KEY)
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets",
           "https://www.googleapis.com/auth/drive"]

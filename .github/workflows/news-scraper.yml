@@ -60,6 +60,6 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: credentials.json
           PLANILHA: ${{ secrets.PLANILHA }}
-          GENAI_API_KEY: ${{ secrets.GENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python alinhamento.py
