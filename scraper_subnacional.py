@@ -24,11 +24,13 @@ TZ_OFFSET_HOURS = int(os.getenv("TZ_OFFSET_HOURS", "0"))
 HTTP_TIMEOUT_S = float(os.getenv("HTTP_TIMEOUT_S", "3"))
 MAX_FEED_CANDIDATES = int(os.getenv("MAX_FEED_CANDIDATES", "10"))
 
+# Sem valor padrão no código: este repo é público, e id de planilha vem de
+# secret. O padrão antigo ainda apontava para a planilha de teste, então quem
+# rodasse sem env escreveria no lugar errado sem perceber.
 SPREADSHEET_ID = (
     os.getenv("PLANILHA_SUBNACIONAL", "").strip()
     or os.getenv("SPREADSHEET_ID", "").strip()
     or os.getenv("PLANILHA", "").strip()
-    or "16pn5Sp6dTwTOLbJPuic_gu2IPAN7E4zPLH2DorUn5Ek"
 ).strip()
 
 ABA_ENTRADA = os.getenv("ABA_ENTRADA", "deduplicado").strip()
