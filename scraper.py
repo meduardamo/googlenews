@@ -127,6 +127,30 @@ PALAVRAS_FORA_DO_NEWS = {
     "Coletivo Feminista": ["gravidez", "ventre", "criança"],
     "ASBAI": ["formação médica", "atenção primária"],
 }
+# Palavras soltas que trocam por expressões (aprovado em 05/11/2026).
+for _c, _k in [("IDEC", "internet"), ("REMS", "esporte"), ("FMCSV", "criança"),
+               ("IEPS", "escolas"), ("ISG", "ensino médio"),
+               ("Vital Strategies", "saúde mental")]:
+    PALAVRAS_FORA_DO_NEWS.setdefault(_c, []).append(_k)
+
+# Expressões que entram só no news, no lugar das palavras soltas acima.
+PALAVRAS_SO_NO_NEWS = {
+    "IDEC": ["regulação da internet", "plataformas digitais", "big techs",
+             "acesso à internet", "provedores de internet", "inclusão digital",
+             "ECA Digital"],
+    "REMS": ["política esportiva", "ministério do esporte", "lei geral do esporte",
+             "bolsa atleta", "esporte escolar", "prática esportiva", "atividade física"],
+    "FMCSV": ["desenvolvimento infantil", "crianças de 0 a 6 anos", "bebês",
+              "mortalidade infantil", "vacinação infantil", "direitos da criança",
+              "violência contra crianças"],
+    "IEPS": ["saúde nas escolas", "saúde mental nas escolas", "programa saúde na escola",
+             "violência nas escolas", "ataques a escolas", "celular nas escolas"],
+    "ISG": ["novo ensino médio", "ensino médio em tempo integral", "ensino médio técnico",
+            "Ideb", "Saeb", "censo escolar", "evasão escolar", "abandono escolar"],
+    "Vital Strategies": ["política de saúde mental", "prevenção do suicídio",
+                         "saúde mental de adolescentes", "saúde mental de jovens",
+                         "atenção psicossocial", "redes sociais e saúde mental"],
+}
 
 
 def parse_client_theme_data(raw: str):
@@ -187,6 +211,10 @@ class ColetorNoticias:
                 tirar = {f.lower() for f in fora}
                 self.clientes[c]['keywords'] = [
                     k for k in self.clientes[c]['keywords'] if k.lower() not in tirar]
+        for c, novas in PALAVRAS_SO_NO_NEWS.items():
+            if c in self.clientes:
+                ja = {k.lower() for k in self.clientes[c]['keywords']}
+                self.clientes[c]['keywords'] += [k for k in novas if k.lower() not in ja]
         self.cliente_patterns = {
             c: [make_wholeword_pattern(k) for k in data['keywords']]
             for c, data in self.clientes.items()
