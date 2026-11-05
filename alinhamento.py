@@ -27,6 +27,13 @@ SLEEP_SEC  = float(os.getenv("ALIGN_SLEEP_SEC", "0"))
 READ_RANGE = os.getenv("ALIGN_READ_RANGE", "")
 SKIP_TITLES = [s.strip() for s in os.getenv("ALIGN_SKIP_TABS", "").split(",") if s.strip()]
 
+# Aba oculta com os links apagados por falta de alinhamento. O scraper lê
+# esta aba para não coletar de novo, na rodada seguinte do mesmo dia, a
+# notícia que acabou de sair (e pagar outra classificação por ela).
+ABA_DESCARTADAS = "_descartadas"
+DESCARTADAS_DIAS = int(os.getenv("DESCARTADAS_DIAS", "3"))
+SKIP_TITLES.append(ABA_DESCARTADAS)
+
 MAX_CELL_CHARS = int(os.getenv("MAX_CELL_CHARS", "47000"))
 
 DELETE_INVALID = os.getenv("DELETE_INVALID", "1").strip() in ("1","true","True","yes","on")
@@ -266,8 +273,38 @@ def _is_invalid_alignment(v):
     s = str(v).strip().lower()
     return s in (
         "não se aplica", "nao se aplica", "não seaplica", "nao seaplica",
-        "nao-se-aplica", "não-se-aplica"
+        "nao-se-aplica", "não-se-aplica",
+        "não alinha", "nao alinha", "não-alinha", "nao-alinha",
     )
+
+
+def _registrar_descartadas(aba, urls):
+    """Acrescenta (aba, url, data) na aba oculta e apaga o que passou de
+    DESCARTADAS_DIAS. Falha aqui não pode impedir a limpeza da aba."""
+    urls = [u for u in urls if str(u).strip()]
+    if not urls:
+        return
+    try:
+        try:
+            wsd = sh.worksheet(ABA_DESCARTADAS)
+        except gspread.WorksheetNotFound:
+            wsd = sh.add_worksheet(ABA_DESCARTADAS, rows=2, cols=3)
+            wsd.update([["aba", "url", "data"]], "A1")
+            sh.batch_update({"requests": [{"updateSheetProperties": {
+                "properties": {"sheetId": wsd.id, "hidden": True},
+                "fields": "hidden"}}]})
+        hoje = pd.Timestamp.now(tz="America/Sao_Paulo").strftime("%Y-%m-%d")
+        corte = (pd.Timestamp.now(tz="America/Sao_Paulo")
+                 - pd.Timedelta(days=DESCARTADAS_DIAS)).strftime("%Y-%m-%d")
+        vals = wsd.get_all_values()
+        antigos = [r[:3] for r in vals[1:] if len(r) >= 3 and r[2] >= corte]
+        novos = [[aba, str(u), hoje] for u in urls]
+        linhas = [["aba", "url", "data"]] + antigos + novos
+        wsd.clear()
+        wsd.resize(rows=len(linhas), cols=3)
+        wsd.update(linhas, "A1", value_input_option="RAW")
+    except Exception as e:
+        print(f"[{aba}] aviso: não registrei os descartados ({e})")
 
 def process_sheet(ws):
     title = ws.title.strip()
@@ -344,6 +381,10 @@ def process_sheet(ws):
     if not idx_to_drop:
         print(f"[{title}] nada para remover.")
         return
+
+    url_col = norm_find_col(df, "url")
+    if url_col:
+        _registrar_descartadas(title, [df.at[i, url_col] for i in idx_to_drop])
 
     sheet_rows_to_delete = [data_start_row + i for i in idx_to_drop]
     deleted = _delete_rows_in_chunks(ws, sheet_rows_to_delete, chunk_size=DELETE_CHUNK_SIZE)

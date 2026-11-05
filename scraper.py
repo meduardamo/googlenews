@@ -441,6 +441,18 @@ class ColetorNoticias:
         # Carrega todas as abas de uma vez → apenas 1 read request
         self._build_ws_cache(sh)
 
+        # Links que o alinhamento já apagou por não alinhar (aba oculta
+        # _descartadas, gravada pelo alinhamento.py): não voltam para a aba.
+        descartadas = {}
+        ws_desc = self._ws_cache.get(sh.id, {}).get("_descartadas")
+        if ws_desc is not None:
+            try:
+                for r in _gsheets_with_retry(ws_desc.get_all_values)[1:]:
+                    if len(r) >= 2:
+                        descartadas.setdefault(r[0], set()).add(r[1])
+            except Exception as e:
+                print(f"aviso: não li a aba _descartadas ({e})")
+
         # Sanitiza campos base
         for col in ['titulo', 'resumo', 'fonte', 'url']:
             if col in df.columns:
@@ -513,6 +525,7 @@ class ColetorNoticias:
                     break
             if url_col_name:
                 existing_urls = set(existing_df[url_col_name].astype(str).tolist())
+            existing_urls |= descartadas.get(ws.title, set())
 
             if not sub.empty and "url" in sub.columns:
                 sub = sub[~sub["url"].astype(str).isin(existing_urls)]
