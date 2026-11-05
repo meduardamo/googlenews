@@ -111,6 +111,13 @@ $descricao
 Tarefa:
 Classificar o alinhamento do **Conteúdo** com a missão do cliente.
 
+Como decidir (vale antes das classes abaixo):
+- Decida pelo ASSUNTO PRINCIPAL do Conteúdo (o que o título e o início do texto ou da ementa tratam). Tema do cliente citado de passagem, em lista ou como exemplo dentro de conteúdo sobre outro assunto (disputa eleitoral, perfil ou agenda de candidato e autoridade, investigação policial, julgamento, economia geral, mercado, cultura, entretenimento, esporte profissional) é "Não Alinha".
+- Só alinha conteúdo com dimensão de política pública, regulação, orçamento, decisão de governo ou de Justiça, dado oficial, pesquisa, levantamento ou debate público sobre um tema do cliente. Caso individual (crime, acidente, morte, celebridade), dica de saúde, de estudo ou de consumo e fato do dia sem essa dimensão é "Não Alinha".
+- Fato de outro país só alinha se for política, regulação, decisão judicial ou dado sobre tema do cliente.
+- A presença de uma palavra do tema não prova alinhamento: falta de luz por temporal não é política de energia; terremoto que fechou escolas não é política de educação.
+- Ato de rotina sobre empresa ou pessoa específica (outorga, autorização, cassação, liberação de usina, afastamento ou dispensa de servidor, concurso, vestibular, homenagem ou moção) é "Não se aplica".
+
 Regras de evidência:
 - Use **apenas** o Conteúdo e a descrição do cliente acima. Não utilize conhecimento próprio sobre o cliente além do que está descrito neste prompt.
 - NÃO exija que o Conteúdo cubra TODA a missão do cliente.
@@ -123,7 +130,7 @@ Classes (escolha exatamente UMA):
 - "Alinha": O objeto/tema do Conteúdo é claro e há evidência explícita de relação com pelo menos 1 frente/eixo do cliente.
 - "Parcial": Use SOMENTE em um destes dois casos:
     (a) Ambiguidade temática — o Conteúdo trata de tema que poderia ou não se encaixar na missão, mas o texto é insuficiente para decidir com segurança;
-    (b) Cobertura incompleta — o Conteúdo aborda parcialmente o tema do cliente, mas mistura substancialmente outras agendas não relacionadas, de modo que a relevância é real porém limitada.
+    (b) Cobertura incompleta — o tema do cliente ocupa parte própria e substancial do Conteúdo (não uma menção), ao lado de outras agendas não relacionadas.
 - "Não Alinha": O tema é claro e não tem relação com a missão do cliente.
 - "Não se aplica": O Conteúdo não é classificável por tema/escopo do cliente com base no texto (exemplos acima), ou é predominantemente ato individual/procedimental sem política pública inferível.
 
