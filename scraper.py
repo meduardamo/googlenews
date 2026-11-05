@@ -112,6 +112,23 @@ Desiderata|Saúde|obesidade infantil; obesidade infantojuvenil; obesidade na ado
 
 
 
+# Palavras que ficam no DOU e no monitor, mas saem só daqui. O news casa a
+# palavra no corpo inteiro do artigo; estas trouxeram 70% ou mais de "Não
+# Alinha" e quase nada útil que outra palavra não pegasse (medição de 05/11/2026).
+PALAVRAS_FORA_DO_NEWS = {
+    "ISG": ["propag", "programa pé-de-meia"],
+    "IDEC": ["fake news", "taxa de juros", "crédito imobiliário", "internet banking",
+             "tv por assinatura", "acordo de paris"],
+    "REMS": ["desenvolvimento social"],
+    "FMCSV": ["bolsa família", "paternidade"],
+    "IEPS": ["emergências climáticas", "seguradoras", "vícios"],
+    "Umane": ["seguradoras", "estado de emergência", "emergências climáticas",
+              "povos originários", "emendas parlamentares"],
+    "Coletivo Feminista": ["gravidez", "ventre", "criança"],
+    "ASBAI": ["formação médica", "atenção primária"],
+}
+
+
 def parse_client_theme_data(raw: str):
     mapping = {}
     for line in raw.splitlines():
@@ -165,6 +182,11 @@ class ColetorNoticias:
             'palavras_por_cliente', 'resumo', 'texto_completo', 'data_coleta'
         ])
         self.clientes = parse_client_theme_data(CLIENT_THEME_DATA)
+        for c, fora in PALAVRAS_FORA_DO_NEWS.items():
+            if c in self.clientes:
+                tirar = {f.lower() for f in fora}
+                self.clientes[c]['keywords'] = [
+                    k for k in self.clientes[c]['keywords'] if k.lower() not in tirar]
         self.cliente_patterns = {
             c: [make_wholeword_pattern(k) for k in data['keywords']]
             for c, data in self.clientes.items()
